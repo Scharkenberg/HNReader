@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "HNReader (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "HNReader (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

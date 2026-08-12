@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Application
+    x:Class="HNReader.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:HNReader">
+  <Application.Resources>
+	<ResourceDictionary>
+	  <ResourceDictionary.MergedDictionaries>
+		<XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+		<!-- Other merged dictionaries here -->
+	  </ResourceDictionary.MergedDictionaries>
+	  <!-- Other app resources here -->
+	  <!-- App font family with fallbacks -->
+	  <FontFamily x:Key="InterTight">/Assets/Fonts/InterTight.ttf#Inter Tight,/Assets/Fonts/InterTight-Italic.ttf#Inter Tight Italic</FontFamily>
+	  <FontFamily x:Key="InterTightItalic">/Assets/Fonts/InterTight-Italic.ttf#Inter Tight Italic</FontFamily>
+	  <!-- Base TextBlock style -->
+	  <Style TargetType="TextBlock">
+		<Setter Property="FontFamily" Value="{StaticResource InterTight}" />
+	  </Style>
+
+	  <!-- Buttons, ContentControls, TextBox, RichTextBlock, etc. -->
+	  <Style TargetType="Button">
+		<Setter Property="FontFamily" Value="{StaticResource InterTight}" />
+	  </Style>
+
+	  <Style TargetType="TextBox">
+		<Setter Property="FontFamily" Value="{StaticResource InterTight}" />
+		<Setter Property="IsColorFontEnabled" Value="True" />
+	  </Style>
+
+	  <Style TargetType="RichTextBlock">
+		<Setter Property="FontFamily" Value="{StaticResource InterTight}" />
+		<Setter Property="IsColorFontEnabled" Value="True" />
+	  </Style>
+
+	  <Style TargetType="ContentControl">
+		<Setter Property="FontFamily" Value="{StaticResource InterTight}" />
+	  </Style>
+	  
+	</ResourceDictionary>
+  </Application.Resources>
+</Application>
