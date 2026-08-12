@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Reflection;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,12 +12,11 @@ namespace HNReader
 {
 	public class HNClient
 	{
-		// Single shared HttpClient
 		private static readonly HttpClient http = new HttpClient(new HttpClientHandler
 		{
 			AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-			UseProxy = true, // keep default; set to true if you need system proxy
-			DefaultProxyCredentials = CredentialCache.DefaultCredentials // optional for corporate proxies
+			UseProxy = true,
+			DefaultProxyCredentials = CredentialCache.DefaultCredentials
 		})
 		{
 			BaseAddress = new Uri("https://hacker-news.firebaseio.com/v0/"),
@@ -32,65 +30,94 @@ namespace HNReader
 			PropertyNameCaseInsensitive = true
 		};
 
-		// Cache for items (Post/CommentRaw) to avoid duplicate network calls
+		// Completed-result cache. The requested CLR type is part of the key because
+		// one HN item can legitimately be deserialized as Post, HnItemRaw, or CommentRaw.
 		private readonly ConcurrentDictionary<string, object> _itemCache = new();
 
-		// Limit concurrent outgoing requests to avoid socket exhaustion
-		private readonly SemaphoreSlim _throttle;
+		// In-flight request cache. Concurrent callers for the same (type, item) await
+		// one HTTP request rather than creating duplicate network traffic.
+		private readonly ConcurrentDictionary<string, Lazy<Task<object?>>> _itemInFlight = new();
 
-		// Default concurrency; tuneable (10-50 depending on environment)
-		public HNClient(int maxConcurrency = 32)
+		private readonly SemaphoreSlim _throttle;
+		private const int DefaultConcurrency = 32;
+		private const int CommentFetchBatchSize = 16;
+
+		public HNClient(int maxConcurrency = DefaultConcurrency)
 		{
+			if (maxConcurrency < 1)
+				throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
+
 			_throttle = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 		}
 
-		private static async Task<T?> RetryAsync<T>(Func<Task<T?>> action, int maxAttempts, TimeSpan delay) where T : class
+		private static bool IsTransientHttpError(HttpRequestException ex)
 		{
-			int attempt = 0;
-			while (true)
+			if (!ex.StatusCode.HasValue)
+				return true;
+
+			var status = (int)ex.StatusCode.Value;
+			return status == 408 || status == 429 || status >= 500;
+		}
+
+		private static async Task<T?> RetryAsync<T>(
+			Func<CancellationToken, Task<T?>> action,
+			CancellationToken ct,
+			int maxAttempts = 3,
+			TimeSpan? initialDelay = null) where T : class
+		{
+			var delay = initialDelay ?? TimeSpan.FromMilliseconds(250);
+
+			for (var attempt = 1; ; attempt++)
 			{
-				attempt++;
+				ct.ThrowIfCancellationRequested();
+
 				try
 				{
-					return await action().ConfigureAwait(false);
+					return await action(ct).ConfigureAwait(false);
 				}
-				catch (HttpRequestException) when (attempt < maxAttempts)
+				catch (HttpRequestException ex) when (attempt < maxAttempts && IsTransientHttpError(ex))
 				{
-					await Task.Delay(delay).ConfigureAwait(false);
-					delay = TimeSpan.FromMilliseconds(delay.TotalMilliseconds * 2);
-					continue;
-				}
-				catch
-				{
-					// Let the caller handle the final exception
-					throw;
+					await Task.Delay(delay, ct).ConfigureAwait(false);
+					delay = TimeSpan.FromMilliseconds(Math.Min(3000, delay.TotalMilliseconds * 2));
 				}
 			}
 		}
 
-		// Public API: get top stories (parallelized)
-		public async Task<HNResult> GetTopStoriesAsync(int limit = 50)
+		public async Task<HNResult> GetTopStoriesAsync(
+			int limit = 50,
+			CancellationToken ct = default)
 		{
 			try
 			{
-				// Try to fetch the IDs with a few retries for transient network errors
-				var ids = await RetryAsync(() => FetchItemWithThrottleAsync<List<int>>("topstories.json", -1), 3, TimeSpan.FromMilliseconds(10000));
+				var ids = await RetryAsync(
+					c => FetchItemWithThrottleAsync<List<int>>("topstories.json", -1, c),
+					ct,
+					maxAttempts: 3,
+					initialDelay: TimeSpan.FromMilliseconds(250)).ConfigureAwait(false);
+
 				if (ids == null)
 					return HNResult.OnFail("Failed to retrieve story IDs.");
 
 				var take = Math.Min(limit, ids.Count);
 				var idSlice = ids.Take(take).ToArray();
 
-				var tasks = idSlice.Select(id => FetchItemWithThrottleAsync<Post>($"item/{id}.json", id)).ToArray();
-				var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+				var tasks = idSlice
+					.Select(id => FetchItemWithThrottleAsync<Post>($"item/{id}.json", id, ct))
+					.ToArray();
 
+				var results = await Task.WhenAll(tasks).ConfigureAwait(false);
 				var posts = results.Where(p => p != null).ToList()!;
+
 				return HNResult.OnSuccess(posts!);
+			}
+			catch (OperationCanceledException) when (ct.IsCancellationRequested)
+			{
+				throw;
 			}
 			catch (HttpRequestException ex)
 			{
-				// Log details for diagnostics (do not throw)
-				System.Diagnostics.Debug.WriteLine($"GetTopStories network error: {ex.Message}; Inner: {ex.InnerException?.Message}");
+				System.Diagnostics.Debug.WriteLine(
+					$"GetTopStories network error: {ex.Message}; Status={(int?)ex.StatusCode}; Inner: {ex.InnerException?.Message}");
 				return HNResult.OnNetworkFail("No internet connection or server unreachable.");
 			}
 			catch (Exception ex)
@@ -100,233 +127,281 @@ namespace HNReader
 			}
 		}
 
-		public async Task<(Post? Post, List<Comment> Comments)> GetItemWithCommentsAsync(int id, CancellationToken ct = default)
+		public async Task<Post?> GetItemAsync(int id, CancellationToken ct = default)
 		{
-			ct.ThrowIfCancellationRequested();
-
-			var post = await GetItemAsync(id).ConfigureAwait(false);
-
-			if (post == null)
-				return (null, new List<Comment>());
-
-			ct.ThrowIfCancellationRequested();
-
-			var comments = await GetCommentsTreeAsync(post).ConfigureAwait(false);
-
-			return (post, comments);
-		}
-		// Public API: get a single item (Post)
-		public async Task<Post?> GetItemAsync(int id)
-		{
-			var obj = await FetchItemWithThrottleAsync<Post>($"item/{id}.json", id).ConfigureAwait(false);
-			return obj;
+			return await FetchItemWithThrottleAsync<Post>($"item/{id}.json", id, ct)
+				.ConfigureAwait(false);
 		}
 
-		// Public API: build comment tree for a post (parallelized)
-		public async Task<List<Comment>> GetCommentsTreeAsync(Post post)
+		/// <summary>
+		/// Fetch the complete comment forest using bounded breadth-first network work.
+		/// Only a small batch of comment fetch tasks exists at any one time.
+		/// </summary>
+		public async Task<List<Comment>> GetCommentsTreeAsync(
+			Post post,
+			CancellationToken ct = default)
 		{
-			var result = new List<Comment>();
-			if (post?.Kids == null || post.Kids.Count == 0) return result;
+			if (post?.Kids == null || post.Kids.Count == 0)
+				return new List<Comment>();
 
-			// For each top-level kid, BuildCommentNodesAsync may return 0..N nodes
-			var tasks = post.Kids.Select(id => BuildCommentNodesAsync(id)).ToArray();
-			var lists = await Task.WhenAll(tasks).ConfigureAwait(false);
+			var rawById = new Dictionary<int, CommentRaw>();
+			var pending = new Queue<int>();
+			var seen = new HashSet<int>();
 
-			foreach (var list in lists)
+			foreach (var kidId in post.Kids)
 			{
-				if (list != null && list.Count > 0)
-					result.AddRange(list);
+				if (seen.Add(kidId))
+					pending.Enqueue(kidId);
 			}
 
-			return result;
-		}
-
-		// --- internal helpers ---
-
-		// Build comment nodes for a given id. Returns 0..N Comment objects.
-		// If the raw item is an "empty placeholder" (no by, no text, not dead/deleted),
-		// this method will skip that node and return its children instead (promote children).
-		private async Task<List<Comment>> BuildCommentNodesAsync(int id)
-		{
-			var result = new List<Comment>();
-
-			try
+			while (pending.Count > 0)
 			{
-				var raw = await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id).ConfigureAwait(false);
-				if (raw == null) return result; // nothing to do
+				ct.ThrowIfCancellationRequested();
 
-				// Determine flags and heuristics
-				bool isDeleted = raw.Deleted == true;
-				bool isDead = raw.Dead == true;
+				var batch = new List<int>(Math.Min(CommentFetchBatchSize, pending.Count));
+				while (pending.Count > 0 && batch.Count < CommentFetchBatchSize)
+					batch.Add(pending.Dequeue());
 
-				// Normalize text and author for heuristics
-				var textRaw = raw.Text ?? string.Empty;
-				var byRaw = raw.By ?? string.Empty;
+				var tasks = batch
+					.Select(id => FetchCommentRawSafeAsync(id, ct))
+					.ToArray();
 
-				bool hasText = !string.IsNullOrWhiteSpace(textRaw);
-				bool hasBy = !string.IsNullOrWhiteSpace(byRaw);
+				var raws = await Task.WhenAll(tasks).ConfigureAwait(false);
 
-				// If this item is an explicit deleted/dead item, keep it (placeholder)
-				// Otherwise, if it has neither author nor text, treat it as an empty placeholder:
-				// skip this node but still build and return its children (promote them).
-				bool isEmptyPlaceholder = !isDeleted && !isDead && !hasText && !hasBy;
-
-				// Build children (if any) in parallel
-				List<Comment> builtChildren = new List<Comment>();
-				if (raw.Kids != null && raw.Kids.Count > 0)
+				for (var i = 0; i < raws.Length; i++)
 				{
-					var childTasks = raw.Kids.Select(BuildCommentNodesAsync).ToArray();
-					var childLists = await Task.WhenAll(childTasks).ConfigureAwait(false);
-					foreach (var cl in childLists)
-						if (cl != null && cl.Count > 0)
-							builtChildren.AddRange(cl);
+					ct.ThrowIfCancellationRequested();
+
+					var raw = raws[i];
+					if (raw == null)
+						continue;
+
+					rawById[raw.Id] = raw;
+
+					if (raw.Kids == null)
+						continue;
+
+					foreach (var childId in raw.Kids)
+					{
+						if (seen.Add(childId))
+							pending.Enqueue(childId);
+					}
+				}
+			}
+
+			// Convert the fetched raw graph to the public Comment graph once.
+			// Memoization prevents rebuilding the same subtree repeatedly.
+			var built = new Dictionary<int, List<Comment>>();
+			var building = new HashSet<int>();
+
+			List<Comment> BuildNodes(int id)
+			{
+				if (built.TryGetValue(id, out var cached))
+					return cached;
+
+				if (!rawById.TryGetValue(id, out var raw))
+					return new List<Comment>();
+
+				// Defensive cycle guard; HN's tree should not contain cycles.
+				if (!building.Add(id))
+					return new List<Comment>();
+
+				var children = new List<Comment>();
+				if (raw.Kids != null)
+				{
+					foreach (var childId in raw.Kids)
+						children.AddRange(BuildNodes(childId));
 				}
 
-				// Use official API descendants count when available; otherwise fall back to builtChildren.Count
-				int officialDescendants = raw.Descendants ?? builtChildren.Count;
+				building.Remove(id);
+
+				var hasText = !string.IsNullOrWhiteSpace(raw.Text);
+				var hasBy = !string.IsNullOrWhiteSpace(raw.By);
+				var isDeleted = raw.Deleted == true;
+				var isDead = raw.Dead == true;
+				var isEmptyPlaceholder = !isDeleted && !isDead && !hasText && !hasBy;
 
 				if (isEmptyPlaceholder)
 				{
-					// Optional debug: log using official descendants value
-					System.Diagnostics.Debug.WriteLine($"Skipping empty comment id={id}, API descendants={officialDescendants}, promoted children={builtChildren.Count}");
-
-					// Skip this node, but return its children (promote them)
-					return builtChildren;
+					built[id] = children;
+					return children;
 				}
 
-				// Otherwise create a Comment node (deleted/dead flags copied)
 				var node = new Comment
 				{
 					Id = raw.Id,
 					By = raw.By,
 					Text = raw.Text ?? string.Empty,
 					Time = raw.Time,
-					Children = builtChildren,
+					Children = children,
 					Deleted = raw.Deleted ?? false,
 					Dead = raw.Dead ?? false,
-					Descendants = officialDescendants,
+					Descendants = raw.Descendants ?? children.Count,
 					Score = raw.Score
 				};
 
-				result.Add(node);
+				var result = new List<Comment> { node };
+				built[id] = result;
 				return result;
 			}
-			catch
+
+			var resultRoots = new List<Comment>();
+			foreach (var rootId in post.Kids)
 			{
-				// On any error, return empty list (caller will ignore)
-				return result;
+				ct.ThrowIfCancellationRequested();
+				resultRoots.AddRange(BuildNodes(rootId));
+			}
+
+			return resultRoots;
+		}
+
+		private async Task<CommentRaw?> FetchCommentRawSafeAsync(
+			int id,
+			CancellationToken ct)
+		{
+			try
+			{
+				return await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, ct)
+					.ConfigureAwait(false);
+			}
+			catch (OperationCanceledException) when (ct.IsCancellationRequested)
+			{
+				throw;
+			}
+			catch (Exception ex)
+			{
+				System.Diagnostics.Debug.WriteLine(
+					$"Comment {id} fetch failed: {ex.Message}");
+				return null;
 			}
 		}
 
-		// Generic fetch with throttle + caching
-		private async Task<T?> FetchItemWithThrottleAsync<T>(string path, int id) where T : class
+		private async Task<T?> FetchItemWithThrottleAsync<T>(
+			string path,
+			int id,
+			CancellationToken ct) where T : class
 		{
-			// The same HN item may legitimately be deserialized as different
-			// CLR types (Post, CommentRaw, HnItemRaw). The cache key therefore
-			// must include the requested type.
 			var cacheKey = $"{typeof(T).FullName}:{id}";
 
 			if (_itemCache.TryGetValue(cacheKey, out var cached))
-			{
 				return cached as T;
-			}
 
-			await _throttle.WaitAsync().ConfigureAwait(false);
+			var request = _itemInFlight.GetOrAdd(
+				cacheKey,
+				_ => new Lazy<Task<object?>>(
+					() => FetchAndCacheAsync<T>(path, cacheKey),
+					LazyThreadSafetyMode.ExecutionAndPublication));
 
 			try
 			{
-				// Double-check after acquiring the throttle.
-				if (_itemCache.TryGetValue(cacheKey, out cached))
+				var value = await request.Value.WaitAsync(ct).ConfigureAwait(false);
+				return value as T;
+			}
+			finally
+			{
+				if (request.IsValueCreated && request.Value.IsCompleted)
 				{
-					return cached as T;
+					if (_itemInFlight.TryGetValue(cacheKey, out var current) &&
+						ReferenceEquals(current, request))
+					{
+						_itemInFlight.TryRemove(cacheKey, out _);
+					}
 				}
+			}
+		}
 
-				var obj = await GetAsync<T>(path).ConfigureAwait(false);
+		private async Task<object?> FetchAndCacheAsync<T>(string path, string cacheKey)
+			where T : class
+		{
+			await _throttle.WaitAsync().ConfigureAwait(false);
+			try
+			{
+				if (_itemCache.TryGetValue(cacheKey, out var cached))
+					return cached;
 
+				var obj = await GetAsync<T>(path, CancellationToken.None).ConfigureAwait(false);
 				if (obj != null)
-				{
 					_itemCache.TryAdd(cacheKey, obj);
-				}
 
 				return obj;
-			}
-			catch
-			{
-				return null;
 			}
 			finally
 			{
 				_throttle.Release();
 			}
 		}
-		private async Task<T?> GetAsync<T>(string path)
-		{
-			try
-			{
-				using var resp = await http.GetAsync(path, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
-				if (!resp.IsSuccessStatusCode)
-				{
-					System.Diagnostics.Debug.WriteLine($"HTTP {(int)resp.StatusCode} {resp.ReasonPhrase} for {path}");
-					return default;
-				}
 
-				await using var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-				return await JsonSerializer.DeserializeAsync<T>(stream, jsonOptions).ConfigureAwait(false);
-			}
-			catch (HttpRequestException ex)
+		private async Task<T?> GetAsync<T>(string path, CancellationToken ct)
+		{
+			using var resp = await http.GetAsync(
+				path,
+				HttpCompletionOption.ResponseHeadersRead,
+				ct).ConfigureAwait(false);
+
+			if (resp.StatusCode == HttpStatusCode.NotFound)
+				return default;
+
+			if (!resp.IsSuccessStatusCode)
 			{
-				// Walk the exception chain using Exception type
-				Exception? e = ex;
-				while (e != null)
-				{
-					System.Diagnostics.Debug.WriteLine($"HttpRequestException chain: {e.GetType().FullName}: {e.Message}");
-					e = e.InnerException;
-				}
-				throw;
+				throw new HttpRequestException(
+					$"HTTP {(int)resp.StatusCode} {resp.ReasonPhrase} for {path}",
+					inner: null,
+					statusCode: resp.StatusCode);
 			}
-			catch (Exception ex)
-			{
-				System.Diagnostics.Debug.WriteLine($"GetAsync unexpected error for {path}: {ex.GetType().FullName}: {ex.Message}");
-				throw;
-			}
+
+			await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+			return await JsonSerializer.DeserializeAsync<T>(stream, jsonOptions, ct)
+				.ConfigureAwait(false);
 		}
 
-		// Build comment node recursively but parallelize children
-		private async Task<Comment?> BuildCommentNodeAsync(int id)
+		public async Task<(string? Type, int Id, int? Parent)> GetItemInfoAsync(
+			int id,
+			CancellationToken ct = default)
 		{
-			try
+			ct.ThrowIfCancellationRequested();
+
+			var raw = await FetchItemWithThrottleAsync<HnItemRaw>(
+				$"item/{id}.json",
+				id,
+				ct).ConfigureAwait(false);
+
+			if (raw == null)
+				return (null, id, null);
+
+			return (raw.Type, raw.Id, raw.Parent);
+		}
+
+		public async Task<(Post? Story, int? CommentId)> GetStoryContextAsync(
+			int itemId,
+			CancellationToken ct = default)
+		{
+			var currentId = itemId;
+
+			while (true)
 			{
-				var raw = await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id).ConfigureAwait(false);
-				if (raw == null) return null;
+				ct.ThrowIfCancellationRequested();
 
-				var node = new Comment
+				var raw = await FetchItemWithThrottleAsync<HnItemRaw>(
+					$"item/{currentId}.json",
+					currentId,
+					ct).ConfigureAwait(false);
+
+				if (raw == null)
+					return (null, null);
+
+				if (string.Equals(raw.Type, "story", StringComparison.OrdinalIgnoreCase))
 				{
-					Id = raw.Id,
-					By = raw.By,
-					Text = raw.Text ?? string.Empty,
-					Time = raw.Time,
-					Children = new List<Comment>(),
-					Descendants = raw.Descendants ?? 0,
-
-					// copy API flags (null -> false)
-					Deleted = raw.Deleted ?? false,
-					Dead = raw.Dead ?? false
-				};
-
-				if (raw.Kids != null && raw.Kids.Count > 0)
-				{
-					// Build children in parallel with bounded concurrency
-					var childTasks = raw.Kids.Select(BuildCommentNodeAsync).ToArray();
-					var children = await Task.WhenAll(childTasks).ConfigureAwait(false);
-					foreach (var c in children)
-						if (c != null) node.Children.Add(c);
+					var story = await GetItemAsync(raw.Id, ct).ConfigureAwait(false);
+					return (story, itemId == raw.Id ? null : itemId);
 				}
 
-				return node;
-			}
-			catch
-			{
-				return null;
+				if (!string.Equals(raw.Type, "comment", StringComparison.OrdinalIgnoreCase) ||
+					!raw.Parent.HasValue)
+				{
+					return (null, null);
+				}
+
+				currentId = raw.Parent.Value;
 			}
 		}
 
@@ -346,60 +421,8 @@ namespace HNReader
 			public bool? Dead { get; set; }
 			public bool? Deleted { get; set; }
 		}
-		public async Task<(string? Type, int Id, int? Parent)> GetItemInfoAsync(int id,	CancellationToken ct = default)
-		{
-			ct.ThrowIfCancellationRequested();
 
-			var raw = await FetchItemWithThrottleAsync<HnItemRaw>(
-				$"item/{id}.json",
-				id).ConfigureAwait(false);
-
-			if (raw == null)
-				return (null, id, null);
-
-			return (raw.Type, raw.Id, raw.Parent);
-		}
-
-		public async Task<(Post? Story, int? CommentId)> GetStoryContextAsync(int itemId, CancellationToken ct = default)
-		{
-			var currentId = itemId;
-
-			while (true)
-			{
-				ct.ThrowIfCancellationRequested();
-
-				var raw = await FetchItemWithThrottleAsync<HnItemRaw>(
-					$"item/{currentId}.json",
-					currentId).ConfigureAwait(false);
-
-				if (raw == null)
-					return (null, null);
-
-				if (string.Equals(
-					raw.Type,
-					"story",
-					StringComparison.OrdinalIgnoreCase))
-				{
-					var story = await GetItemAsync(raw.Id).ConfigureAwait(false);
-
-					return (story, itemId == raw.Id ? null : itemId);
-				}
-
-				if (!string.Equals(
-					raw.Type,
-					"comment",
-					StringComparison.OrdinalIgnoreCase) ||
-					!raw.Parent.HasValue)
-				{
-					return (null, null);
-				}
-
-				currentId = raw.Parent.Value;
-			}
-		}
-
-		// Raw shape for comment deserialization
-		private class CommentRaw
+		private sealed class CommentRaw
 		{
 			public int Id { get; set; }
 			public string? By { get; set; }
@@ -408,40 +431,24 @@ namespace HNReader
 			public List<int>? Kids { get; set; }
 			public int? Descendants { get; set; }
 			public int? Score { get; set; }
-			// HN API flags
 			public bool? Deleted { get; set; }
 			public bool? Dead { get; set; }
 		}
 
-		// Public streaming API: yields top-level Comment nodes as they are built.
-		// Uses existing BuildCommentNodesAsync internally.
-		public async IAsyncEnumerable<Comment> GetCommentsStreamAsync(Post post, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+		// Compatibility API. Phase 2 will make the interactive path consume this
+		// incrementally; for now it preserves the same public surface.
+		public async IAsyncEnumerable<Comment> GetCommentsStreamAsync(
+			Post post,
+			[System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
 		{
-			if (post?.Kids == null) yield break;
-
-			foreach (var kidId in post.Kids)
+			var comments = await GetCommentsTreeAsync(post, ct).ConfigureAwait(false);
+			foreach (var comment in comments)
 			{
 				ct.ThrowIfCancellationRequested();
-				List<Comment> built;
-				try
-				{
-					// BuildCommentNodesAsync is already implemented and returns 0..N Comment objects for an id
-					built = await BuildCommentNodesAsync(kidId).ConfigureAwait(false);
-				}
-				catch
-				{
-					built = new List<Comment>();
-				}
-
-				foreach (var c in built)
-				{
-					ct.ThrowIfCancellationRequested();
-					yield return c;
-				}
+				yield return comment;
 			}
 		}
 	}
-
 
 	public class Comment
 	{
@@ -472,11 +479,8 @@ namespace HNReader
 			get
 			{
 				if (Score.HasValue && Score.Value != 0)
-				{
-					// show plus sign for positive points; adjust wording if you prefer "5 points"
 					return $"+{Score.Value} · {TimeAgo}";
-				}
-				// no score available or zero -> show only time
+
 				return TimeAgo;
 			}
 		}
@@ -499,7 +503,6 @@ namespace HNReader
 
 		public static HNResult OnNetworkFail(string message) =>
 			new HNResult { Success = false, IsNetworkError = true, ErrorMessage = message };
-
 	}
 
 	public class Post
@@ -512,14 +515,13 @@ namespace HNReader
 		public string? Url { get; set; }
 		public List<int>? Kids { get; set; }
 		public int Descendants { get; set; } = 0;
-		public string? Text { get; set; }    // HN "text" field for self posts (may be null)
+		public string? Text { get; set; }
 		public bool HasText => !string.IsNullOrWhiteSpace(Text);
 
 		public DateTime Timestamp =>
 			DateTimeOffset.FromUnixTimeSeconds(Time).DateTime;
 
 		public string ScoreText => $"{Score} points";
-
 		public string CommentCountText => $"{Descendants} comments";
 
 		public string TimeAgo

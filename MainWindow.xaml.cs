@@ -16,9 +16,6 @@ using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.IO.Compression;
-using System.Net;
-using System.Net.Http;
-using Windows.Networking.Connectivity;
 using System.Text.RegularExpressions;
 using Windows.System;
 
@@ -393,26 +390,6 @@ namespace HNReader
 			WriteIndented = false
 		};
 
-		private async Task<bool> IsHackerNewsReachableAsync(CancellationToken ct)
-		{
-			try
-			{
-				var profile = NetworkInformation.GetInternetConnectionProfile();
-				if (profile == null) return false;
-				var level = profile.GetNetworkConnectivityLevel();
-				if (level == NetworkConnectivityLevel.None || level == NetworkConnectivityLevel.LocalAccess) return false;
-			}
-			catch { /* fall back to HTTP probe */ }
-
-			try
-			{
-				using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-				using var req = new HttpRequestMessage(HttpMethod.Head, "https://news.ycombinator.com/");
-				using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-				return resp.StatusCode == HttpStatusCode.OK || resp.StatusCode == HttpStatusCode.Found;
-			}
-			catch { return false; }
-		}
 		private async Task CleanupLeftoverTempFilesAsync()
 		{
 			try
@@ -621,7 +598,7 @@ namespace HNReader
 		private async Task LoadUntilMinAsync(CancellationToken ct)
 		{
 			// serialize with the same semaphore so we don't conflict with other loads
-			await _postsLoadLock.WaitAsync();
+			await _postsLoadLock.WaitAsync(ct);
 			try
 			{
 				_isPostsLoading = true;
@@ -647,7 +624,7 @@ namespace HNReader
 					// Also ensure we request at least one batch beyond current offset.
 					var requestCount = Math.Max(_postsOffset + PostsBatchSize, _minInitialPosts);
 
-					var result = await client.GetTopStoriesAsync(requestCount);
+					var result = await client.GetTopStoriesAsync(requestCount, ct);
 					System.Diagnostics.Debug.WriteLine($"LoadUntilMinAsync: GetTopStoriesAsync returned Success={result.Success} Posts.Count={result.Posts?.Count ?? 0}");
 
 					if (ct.IsCancellationRequested) break;
@@ -719,9 +696,9 @@ namespace HNReader
 			}
 		}
 
-		private async Task FillInitialPostsAsync(CancellationToken ct)
+		private async Task<bool> FillInitialPostsAsync(CancellationToken ct)
 		{
-			await _postsLoadLock.WaitAsync();
+			await _postsLoadLock.WaitAsync(ct);
 			try
 			{
 				_isPostsLoading = true;
@@ -743,12 +720,12 @@ namespace HNReader
 				// initial request: ask for at least the minimum target
 				var requestCount = Math.Max(_minInitialPosts, PostsBatchSize);
 
-				HNResult result = await client.GetTopStoriesAsync(requestCount).ConfigureAwait(false);
+				HNResult result = await client.GetTopStoriesAsync(requestCount, ct).ConfigureAwait(false);
 
 				if (!result.Success)
 				{
 					await RunOnUiAsync(async () => await ShowErrorDialog(result.ErrorMessage ?? "Unknown error."));
-					return;
+					return false;
 				}
 
 				// keep appending batches until we reach the minimum or run out
@@ -776,7 +753,7 @@ namespace HNReader
 					if (_posts.Count < _minInitialPosts && _postsHasMore)
 					{
 						var needed = Math.Max(_minInitialPosts, _postsOffset + PostsBatchSize);
-						result = await client.GetTopStoriesAsync(needed).ConfigureAwait(false);
+						result = await client.GetTopStoriesAsync(needed, ct).ConfigureAwait(false);
 						if (!result.Success) break;
 						// small pause so UI can render
 						await Task.Delay(50, ct).ConfigureAwait(false);
@@ -785,11 +762,17 @@ namespace HNReader
 
 					break;
 				}
+
+				return true;
 			}
-			catch (OperationCanceledException) { }
+			catch (OperationCanceledException)
+			{
+				return false;
+			}
 			catch (Exception ex)
 			{
 				System.Diagnostics.Debug.WriteLine($"FillInitialPostsAsync error: {ex}");
+				return false;
 			}
 			finally
 			{
@@ -824,50 +807,23 @@ namespace HNReader
 			_postsLoadCts?.Cancel();
 			_postsLoadCts?.Dispose();
 			_postsLoadCts = new CancellationTokenSource();
+			var ct = _postsLoadCts.Token;
 
-			// If not forced, decide whether to fetch or load cache
 			if (!force)
 			{
 				var last = LoadLastFetchTime();
+				var cacheIsFresh = last != DateTimeOffset.MinValue &&
+					(DateTimeOffset.UtcNow - last) < FetchInterval;
 
-				// Probe site reachability on background thread with cancellation token
-				var ct = _postsLoadCts?.Token ?? CancellationToken.None;
-				bool reachable = false;
-				try
+				if (cacheIsFresh)
 				{
-					reachable = await IsHackerNewsReachableAsync(ct).ConfigureAwait(false);
-
-				}
-				catch { reachable = false; }
-
-				if (reachable)
-				{
-					// Site reachable: respect the 6-hour rule
-					if (last != DateTimeOffset.MinValue && (DateTimeOffset.UtcNow - last) < FetchInterval)
-					{
-						System.Diagnostics.Debug.WriteLine($"Site reachable but last fetch was {(DateTimeOffset.UtcNow - last)} ago — skipping network fetch and using cache if available.");
-						var loaded = await LoadPostsCacheAsync().ConfigureAwait(false);
-						if (loaded)
-						{
-							System.Diagnostics.Debug.WriteLine($"Loaded {_posts.Count} posts from cache (recent).");
-							return;
-						}
-						// no cache -> fall through to network fetch
-					}
-					// else: last fetch too old or missing -> proceed to network fetch
-				}
-				else
-				{
-					// Site not reachable: prefer cache
-					System.Diagnostics.Debug.WriteLine("Hacker News not reachable (network/site probe failed). Attempting to load cache.");
 					var loaded = await LoadPostsCacheAsync().ConfigureAwait(false);
 					if (loaded)
 					{
-						System.Diagnostics.Debug.WriteLine($"Loaded {_posts.Count} posts from cache (offline).");
+						System.Diagnostics.Debug.WriteLine(
+							$"Loaded {_posts.Count} posts from fresh cache.");
 						return;
 					}
-					// If cache missing, fall through and attempt network fetch (optional)
-					System.Diagnostics.Debug.WriteLine("No usable cache found; will attempt network fetch despite probe failure.");
 				}
 			}
 
@@ -875,7 +831,13 @@ namespace HNReader
 
 			try
 			{
-				await FillInitialPostsAsync(_postsLoadCts!.Token);
+				var fetched = await FillInitialPostsAsync(ct);
+				if (!fetched && !force && !ct.IsCancellationRequested)
+				{
+					System.Diagnostics.Debug.WriteLine(
+						"Network fetch failed. Attempting cached posts.");
+					await LoadPostsCacheAsync().ConfigureAwait(false);
+				}
 			}
 			finally
 			{
@@ -997,7 +959,7 @@ namespace HNReader
 
 				if (string.Equals(info.Type, "story", StringComparison.OrdinalIgnoreCase))
 				{
-					var post = await client.GetItemAsync(id.Value)
+					var post = await client.GetItemAsync(id.Value, ct)
 						.ConfigureAwait(false);
 
 					if (post == null)
@@ -1165,36 +1127,6 @@ namespace HNReader
 
 			return tcs.Task;
 		}
-		private Task RunOnUiAsyncFunc(Func<Task> func)
-		{
-			var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
-			var dq = this.DispatcherQueue;
-			if (dq == null)
-			{
-				_ = Task.Run(async () =>
-				{
-					try { await func(); tcs.SetResult(null); }
-					catch (Exception ex) { tcs.SetException(ex); }
-				});
-				return tcs.Task;
-			}
-
-			var enqueued = dq.TryEnqueue(async () =>
-			{
-				try { await func(); tcs.SetResult(null); }
-				catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"RunOnUiAsyncFunc: func threw: {ex}"); tcs.SetException(ex); }
-			});
-
-			if (!enqueued)
-			{
-				var ex = new InvalidOperationException("DispatcherQueue.TryEnqueue returned false for RunOnUiAsyncFunc");
-				System.Diagnostics.Debug.WriteLine($"RunOnUiAsyncFunc: TryEnqueue returned false");
-				tcs.SetException(ex);
-			}
-
-			return tcs.Task;
-		}
-
 		private TreeViewNode? FindNodeByCommentIdRecursive(TreeViewNode node, string id)
 		{
 			if (node.Content is Comment c && c.Id.ToString() == id) return node;
@@ -1291,9 +1223,11 @@ namespace HNReader
 
 		private async Task LoadPostsIncrementalAsync(CancellationToken externalCt)
 		{
-			await _postsLoadLock.WaitAsync();
+			var lockHeld = false;
 			try
 			{
+				await _postsLoadLock.WaitAsync(externalCt);
+				lockHeld = true;
 				if (!_postsHasMore) return;
 				_isPostsLoading = true;
 
@@ -1321,7 +1255,7 @@ namespace HNReader
 					// On first load ask the API for enough IDs to cover the minimum target (avoids repeated small fetches)
 					var requestCount = _isFirstLoad ? Math.Max(_postsOffset + PostsBatchSize, _minInitialPosts) : _postsOffset + PostsBatchSize;
 
-					var result = await client.GetTopStoriesAsync(requestCount);
+					var result = await client.GetTopStoriesAsync(requestCount, ct);
 					System.Diagnostics.Debug.WriteLine($"GetTopStoriesAsync returned Success={result.Success} Posts.Count={result.Posts?.Count ?? 0}");
 
 					if (ct.IsCancellationRequested) break;
@@ -1338,15 +1272,15 @@ namespace HNReader
 						System.Diagnostics.Debug.WriteLine($"DEBUG: slice.Count={slice.Count} _postsOffset={_postsOffset}");
 						// append directly (we're on UI thread via StartPostsInitialLoadAsync)
 						foreach (var p in slice) _posts.Add(p);
-					
-					ApplySavedFontAndIndent();
 
-					_postsOffset += slice.Count;
-					_postsHasMore = slice.Count >= PostsBatchSize && result.Posts!.Count >= _postsOffset;
-					SaveLastFetchTime(DateTimeOffset.UtcNow);
-					_ = SavePostsCacheAsync();
+						ApplySavedFontAndIndent();
 
-					System.Diagnostics.Debug.WriteLine($"POST-APPEND: _posts.Count={_posts.Count}; PostsList.Items.Count={PostsList.Items.Count}");
+						_postsOffset += slice.Count;
+						_postsHasMore = slice.Count >= PostsBatchSize && result.Posts!.Count >= _postsOffset;
+						SaveLastFetchTime(DateTimeOffset.UtcNow);
+						_ = SavePostsCacheAsync();
+
+						System.Diagnostics.Debug.WriteLine($"POST-APPEND: _posts.Count={_posts.Count}; PostsList.Items.Count={PostsList.Items.Count}");
 
 					}
 					catch { }
@@ -1382,7 +1316,8 @@ namespace HNReader
 					});
 				}
 				catch { }
-				_postsLoadLock.Release();
+				if (lockHeld)
+					_postsLoadLock.Release();
 			}
 		}
 
@@ -1608,7 +1543,7 @@ namespace HNReader
 					ct.ThrowIfCancellationRequested();
 
 					comments = await client
-						.GetCommentsTreeAsync(post)
+						.GetCommentsTreeAsync(post, ct)
 						.ConfigureAwait(false);
 
 					System.Diagnostics.Debug.WriteLine(
@@ -2179,7 +2114,7 @@ namespace HNReader
 
 			try
 			{
-				await Task.Run(() => FetchAndCacheAllCommentsAsync(ct));
+				await FetchAndCacheAllCommentsAsync(ct);
 				// persist posts+comments to disk
 				await SavePostsCacheAsync().ConfigureAwait(false);
 				System.Diagnostics.Debug.WriteLine("SaveOffline: posts+comments cached.");
@@ -2214,7 +2149,7 @@ namespace HNReader
 						List<Comment> tree;
 						try
 						{
-							tree = await client.GetCommentsTreeAsync(post).ConfigureAwait(false);
+							tree = await client.GetCommentsTreeAsync(post, ct).ConfigureAwait(false);
 						}
 						catch
 						{
