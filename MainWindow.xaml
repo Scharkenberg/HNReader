@@ -166,7 +166,6 @@
 		  Background="Transparent"
           HorizontalAlignment="Stretch"
           VerticalAlignment="Stretch"
-          ItemInvoked="CommentsTree_ItemInvoked"
 		  Loaded="CommentsTree_Loaded"
 		  LayoutUpdated="CommentsTree_LayoutUpdated">
 
@@ -188,7 +187,7 @@
 				<RichTextBlock Grid.Row="1"
                        helpers:HtmlExtensions.Html="{Binding Content.Text}"
                        TextWrapping="Wrap"
-                       FontSize="16"
+                       FontSize="14"
 					   FontFamily="{StaticResource InterTight}"
                        Margin="2,2,0,0"
                        HorizontalAlignment="Stretch"

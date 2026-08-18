@@ -7,16 +7,17 @@ using Microsoft.UI.Xaml.Media;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Net.Http;
 using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.Graphics.Display;
-using System.IO;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.IO.Compression;
-using System.Text.RegularExpressions;
 using Windows.System;
 
 namespace HNReader
@@ -25,15 +26,13 @@ namespace HNReader
 	{
 		private readonly HNClient client = new();
 		private bool _isRefreshing = false;
-		public ObservableCollection<Comment> Comments { get; } = new();
 		private AppWindow _appWindow;
 		private CancellationTokenSource? _resizeCts;
-		private CancellationTokenSource? _chevronCts;
 		private CancellationTokenSource? _currentCommentsLoadCts;
 		private bool _isClosing = false;
 
 		// Posts incremental state
-		private ObservableCollection<Post> _posts = new ObservableCollection<Post>();
+		private ObservableCollection<Post> _posts = [];
 		private CancellationTokenSource? _postsLoadCts;
 		private readonly SemaphoreSlim _postsLoadLock = new SemaphoreSlim(1, 1);
 		private bool _postsHasMore = true;
@@ -44,11 +43,17 @@ namespace HNReader
 		private bool _isPostsLoading = false;
 		private const double LoadThresholdPx = 100.0;
 		private ScrollViewer? _postsScrollViewer;
-		// ephemeral post shown only in the content pane (not part of _posts, not cached)
-		private Post? _ephemeralPost;
-		private int? _ephemeralCommentId;
+		// Current content state. Ephemeral content is never inserted into _posts.
+		private Post? _currentPost;
+		private bool _currentIsEphemeral;
+		private int? _currentFocusCommentId;
 
-		private readonly SemaphoreSlim _saveCacheLock = new SemaphoreSlim(1, 1);
+		private readonly object _cacheStateLock = new();
+		private CancellationTokenSource? _cacheSaveDebounceCts;
+		private bool _cacheDirty;
+		private const int CacheSaveDebounceMs = 1200;
+		private readonly Dictionary<int, DateTimeOffset> _cachedCommentFetchUtc = [];
+		private readonly SemaphoreSlim _saveCacheLock = new(1, 1);
 		private const int SaveCacheMaxRetries = 6;
 		private static readonly TimeSpan SaveCacheInitialDelay = TimeSpan.FromMilliseconds(150);
 		private const string PostsCacheTempFileNamePrefix = "posts_cache.tmp";
@@ -57,8 +62,9 @@ namespace HNReader
 		private const string LastFetchKey = "LastFetchUtc";
 		private const string PostsCacheFileName = "posts_cache.json";
 		private const string PostsCacheTempFileName = "posts_cache.tmp.json";
-		private const int PostsCacheVersion = 1; // bump if DTO changes
-		private readonly Dictionary<int, List<CommentCacheItem>> _cachedComments = new();
+		private const int PostsCacheVersion = 1; // bump only for incompatible cache changes
+		private readonly Dictionary<int, List<CommentCacheItem>> _cachedComments = [];
+		private static readonly TimeSpan CommentCacheFreshness = TimeSpan.FromHours(1);
 		private CancellationTokenSource? _saveOfflineCts;
 		private sealed class CommentCacheItem
 		{
@@ -79,14 +85,17 @@ namespace HNReader
 			public long Time { get; set; }
 			public string? Url { get; set; }
 			public string? Text { get; set; }
-			public int Descendants { get; set; } // NEW: total number of comments
+			public int Descendants { get; set; }
+			public DateTimeOffset? LastCommentsFetchUtc { get; set; }
 			public List<CommentCacheItem>? Comments { get; set; }
+			public long? CommentsFetchedUnix { get; set; }
+			public List<int>? Kids { get; set; }
 		}
 
 		private sealed class PostsCache
 		{
 			public int Version { get; set; } = PostsCacheVersion;
-			public List<PostCacheItem> Items { get; set; } = new();
+			public List<PostCacheItem> Items { get; set; } = [];
 		}
 
 		private const double FontStep = 1;
@@ -98,6 +107,8 @@ namespace HNReader
 
 		private Windows.Graphics.Display.DisplayInformation? _displayInfo;
 		private double _cachedScale = 1.0;
+		private static bool _zIndexResolved;
+		private static DependencyProperty? _cachedZIndexProperty;
 		private Microsoft.UI.Windowing.AppWindow? _cachedAppWindow;
 
 		private FrameworkElement RootElement => (FrameworkElement)this.Content;
@@ -226,7 +237,6 @@ namespace HNReader
 
 				SafeCancelDispose(ref _currentCommentsLoadCts);
 				SafeCancelDispose(ref _resizeCts);
-				SafeCancelDispose(ref _chevronCts);
 
 				if (_displayInfo != null)
 				{
@@ -352,7 +362,7 @@ namespace HNReader
 			catch { }
 		}
 
-		private double LoadSetting(string key, double defaultValue)
+		private static double LoadSetting(string key, double defaultValue)
 		{
 			try
 			{
@@ -365,7 +375,7 @@ namespace HNReader
 			return defaultValue;
 		}
 
-		private void SaveLastFetchTime(DateTimeOffset when)
+		private static void SaveLastFetchTime(DateTimeOffset when)
 		{
 			// store as Unix seconds (SaveSetting already exists in your file)
 			try { SaveSetting(LastFetchKey, (double)when.ToUnixTimeSeconds()); }
@@ -390,7 +400,7 @@ namespace HNReader
 			WriteIndented = false
 		};
 
-		private async Task CleanupLeftoverTempFilesAsync()
+		private static async Task CleanupLeftoverTempFilesAsync()
 		{
 			try
 			{
@@ -409,15 +419,23 @@ namespace HNReader
 			catch { /* ignore */ }
 		}
 
-		private async Task SavePostsCacheAsync()
+		private async Task<PostsCache> CapturePostsCacheSnapshotAsync()
 		{
-			await _saveCacheLock.WaitAsync().ConfigureAwait(false);
-			try
+			List<Post> postsSnapshot = [];
+
+			await RunOnUiAsync(() =>
 			{
-				// Build DTO list
-				var items = _posts.Select(p =>
+				postsSnapshot = [.. _posts];
+			});
+
+			List<PostCacheItem> items;
+			lock (_cacheStateLock)
+			{
+				items = [.. postsSnapshot.Select(p =>
 				{
 					_cachedComments.TryGetValue((int)p.Id, out var commentsForPost);
+					_cachedCommentFetchUtc.TryGetValue((int)p.Id, out var fetchedUtc);
+
 					return new PostCacheItem
 					{
 						Id = (int)p.Id,
@@ -428,26 +446,40 @@ namespace HNReader
 						Url = p.Url,
 						Text = p.Text,
 						Descendants = p.Descendants,
-						Comments = commentsForPost
+						Comments = commentsForPost,
+						Kids = p.Kids,
+						CommentsFetchedUnix = _cachedCommentFetchUtc.TryGetValue((int)p.Id, out var utc)
+							? utc.ToUnixTimeSeconds()
+							: null
 					};
-				}).ToList();
+				})];
+			}
 
-				var cache = new PostsCache { Items = items };
+			return new PostsCache { Items = items };
+		}
+		private async Task SavePostsCacheAsync(bool force = false)
+		{
+			await _saveCacheLock.WaitAsync().ConfigureAwait(false);
+			try
+			{
+				if (!force && !_cacheDirty)
+					return;
+
+				var cache = await CapturePostsCacheSnapshotAsync().ConfigureAwait(false);
 
 				var folder = Windows.Storage.ApplicationData.Current.LocalFolder;
 
-				// Best-effort cleanup of stale temp files before creating a new one
-				try { await CleanupLeftoverTempFilesAsync().ConfigureAwait(false); } catch { /* ignore */ }
+				try { await CleanupLeftoverTempFilesAsync().ConfigureAwait(false); } catch { }
 
-				// Unique temp filename
 				var uniqueTempName = $"{PostsCacheTempFileNamePrefix}.{Guid.NewGuid():N}.tmp";
 				Windows.Storage.StorageFile? tempFile = null;
 
 				try
 				{
-					tempFile = await folder.CreateFileAsync(uniqueTempName, Windows.Storage.CreationCollisionOption.ReplaceExisting).AsTask().ConfigureAwait(false);
+					tempFile = await folder.CreateFileAsync(
+						uniqueTempName,
+						Windows.Storage.CreationCollisionOption.ReplaceExisting).AsTask().ConfigureAwait(false);
 
-					// Write compressed JSON to the temp file and ensure streams are closed
 					using (var outStream = await tempFile.OpenStreamForWriteAsync().ConfigureAwait(false))
 					{
 						using var brotli = new BrotliStream(outStream, CompressionLevel.Optimal, leaveOpen: true);
@@ -458,13 +490,11 @@ namespace HNReader
 				}
 				catch (Exception writeEx)
 				{
-					// If writing fails, try to delete temp file and rethrow
 					try { if (tempFile != null) await tempFile.DeleteAsync().AsTask().ConfigureAwait(false); } catch { }
 					System.Diagnostics.Debug.WriteLine($"SavePostsCacheAsync: write failed: {writeEx}");
 					throw;
 				}
 
-				// Attempt to move temp -> final with retries on sharing/permission errors
 				var finalFileName = PostsCacheFileName;
 				int attempt = 0;
 				var delay = SaveCacheInitialDelay;
@@ -474,10 +504,9 @@ namespace HNReader
 				{
 					try
 					{
-						// Move temp -> final (ReplaceExisting)
-						await tempFile.MoveAsync(folder, finalFileName, Windows.Storage.NameCollisionOption.ReplaceExisting).AsTask().ConfigureAwait(false);
+						await tempFile.MoveAsync(folder, finalFileName, Windows.Storage.NameCollisionOption.ReplaceExisting)
+							.AsTask().ConfigureAwait(false);
 
-						// Optionally log compressed size
 						try
 						{
 							var finalFile = await folder.GetFileAsync(finalFileName).AsTask().ConfigureAwait(false);
@@ -486,34 +515,14 @@ namespace HNReader
 						}
 						catch { }
 
-						break; // success
+						_cacheDirty = false;
+						break;
 					}
-					catch (System.Runtime.InteropServices.COMException comEx) when ((uint)comEx.HResult == 0x80070020u /* ERROR_SHARING_VIOLATION */)
+					catch (System.Runtime.InteropServices.COMException comEx) when ((uint)comEx.HResult == 0x80070020u)
 					{
 						attempt++;
-						System.Diagnostics.Debug.WriteLine($"SavePostsCacheAsync: sharing violation on attempt {attempt}: {comEx.Message}");
-
 						if (attempt >= SaveCacheMaxRetries)
 						{
-							System.Diagnostics.Debug.WriteLine($"SavePostsCacheAsync: giving up after {attempt} attempts (sharing violation).");
-							try { await tempFile.DeleteAsync().AsTask().ConfigureAwait(false); } catch { }
-							break;
-						}
-
-						// backoff + jitter
-						var jitter = TimeSpan.FromMilliseconds(rnd.Next(0, 120));
-						await Task.Delay(delay + jitter).ConfigureAwait(false);
-						delay = TimeSpan.FromMilliseconds(Math.Min(2000, delay.TotalMilliseconds * 2));
-						continue;
-					}
-					catch (UnauthorizedAccessException uaEx)
-					{
-						attempt++;
-						System.Diagnostics.Debug.WriteLine($"SavePostsCacheAsync: UnauthorizedAccessException on attempt {attempt}: {uaEx.Message}");
-
-						if (attempt >= SaveCacheMaxRetries)
-						{
-							System.Diagnostics.Debug.WriteLine($"SavePostsCacheAsync: giving up after {attempt} attempts (unauthorized).");
 							try { await tempFile.DeleteAsync().AsTask().ConfigureAwait(false); } catch { }
 							break;
 						}
@@ -521,11 +530,22 @@ namespace HNReader
 						var jitter = TimeSpan.FromMilliseconds(rnd.Next(0, 120));
 						await Task.Delay(delay + jitter).ConfigureAwait(false);
 						delay = TimeSpan.FromMilliseconds(Math.Min(2000, delay.TotalMilliseconds * 2));
-						continue;
+					}
+					catch (UnauthorizedAccessException)
+					{
+						attempt++;
+						if (attempt >= SaveCacheMaxRetries)
+						{
+							try { await tempFile.DeleteAsync().AsTask().ConfigureAwait(false); } catch { }
+							break;
+						}
+
+						var jitter = TimeSpan.FromMilliseconds(rnd.Next(0, 120));
+						await Task.Delay(delay + jitter).ConfigureAwait(false);
+						delay = TimeSpan.FromMilliseconds(Math.Min(2000, delay.TotalMilliseconds * 2));
 					}
 					catch (System.IO.FileNotFoundException fnf)
 					{
-						// Temp file disappeared; nothing to do
 						System.Diagnostics.Debug.WriteLine($"SavePostsCacheAsync: temp file not found during move: {fnf.Message}");
 						break;
 					}
@@ -543,6 +563,15 @@ namespace HNReader
 			}
 		}
 
+		private async Task<Post> EnsureKidsAsync(Post post, CancellationToken ct)
+		{
+			if (post.Kids != null && post.Kids.Count > 0)
+				return post;
+
+			var hydrated = await client.GetItemAsync(post.Id, ct).ConfigureAwait(false);
+			return hydrated ?? post;
+		}
+
 		private async Task<bool> LoadPostsCacheAsync()
 		{
 			try
@@ -557,11 +586,16 @@ namespace HNReader
 				if (cache == null || cache.Items == null || cache.Items.Count == 0) return false;
 				if (cache.Version != PostsCacheVersion) return false;
 
-				// populate in-memory caches and UI
-				_cachedComments.Clear();
+				lock (_cacheStateLock)
+				{
+					_cachedComments.Clear();
+					_cachedCommentFetchUtc.Clear();
+				}
+
 				await RunOnUiAsync(() =>
 				{
 					_posts.Clear();
+
 					foreach (var it in cache.Items)
 					{
 						_posts.Add(new Post
@@ -573,19 +607,27 @@ namespace HNReader
 							Time = it.Time,
 							Url = it.Url,
 							Descendants = it.Descendants,
+							Kids = it.Kids,
 							Text = it.Text
 						});
 
-						if (it.Comments != null && it.Comments.Count > 0)
+						lock (_cacheStateLock)
 						{
-							_cachedComments[it.Id] = it.Comments;
+							if (it.Comments != null && it.Comments.Count > 0)
+								_cachedComments[it.Id] = it.Comments;
+
+							if (it.CommentsFetchedUnix.HasValue)
+								_cachedCommentFetchUtc[it.Id] =
+									DateTimeOffset.FromUnixTimeSeconds(it.CommentsFetchedUnix.Value);
 						}
 					}
+
 					ApplySavedFontAndIndent();
 				});
 
 				_postsOffset = _posts.Count;
 				_postsHasMore = true;
+				_cacheDirty = false;
 				return true;
 			}
 			catch (Exception ex)
@@ -594,7 +636,42 @@ namespace HNReader
 				return false;
 			}
 		}
+		private void MarkPostsCacheDirty(bool scheduleSave = true)
+		{
+			_cacheDirty = true;
+			if (scheduleSave)
+				SchedulePostsCacheSave();
+		}
 
+		private void SchedulePostsCacheSave()
+		{
+			var old = Interlocked.Exchange(ref _cacheSaveDebounceCts, new CancellationTokenSource());
+			try { old?.Cancel(); } catch { }
+			try { old?.Dispose(); } catch { }
+
+			var token = _cacheSaveDebounceCts.Token;
+
+			_ = Task.Run(async () =>
+			{
+				try
+				{
+					await Task.Delay(CacheSaveDebounceMs, token).ConfigureAwait(false);
+					if (!token.IsCancellationRequested)
+						await FlushPostsCacheSaveAsync().ConfigureAwait(false);
+				}
+				catch (OperationCanceledException) { }
+				catch (Exception ex)
+				{
+					System.Diagnostics.Debug.WriteLine($"SchedulePostsCacheSave error: {ex}");
+				}
+			});
+		}
+
+		private async Task FlushPostsCacheSaveAsync()
+		{
+			if (!_cacheDirty) return;
+			await SavePostsCacheAsync(force: false).ConfigureAwait(false);
+		}
 		private async Task LoadUntilMinAsync(CancellationToken ct)
 		{
 			// serialize with the same semaphore so we don't conflict with other loads
@@ -631,7 +708,9 @@ namespace HNReader
 
 					if (!result.Success)
 					{
-						await RunOnUiAsync(async () => await ShowErrorDialog(result.ErrorMessage ?? "Unknown error."));
+						var loaded = await LoadPostsCacheAsync().ConfigureAwait(false);
+						if (!loaded)
+							await RunOnUiAsync(async () => await ShowErrorDialog(result.ErrorMessage ?? "Unknown error."));
 						break;
 					}
 
@@ -655,9 +734,7 @@ namespace HNReader
 					_postsOffset += slice.Count;
 					_postsHasMore = slice.Count >= PostsBatchSize && result.Posts.Count >= _postsOffset;
 					SaveLastFetchTime(DateTimeOffset.UtcNow);
-#pragma warning disable CS4014
-					await SavePostsCacheAsync().ConfigureAwait(false);
-#pragma warning restore CS4014
+					MarkPostsCacheDirty();
 
 					System.Diagnostics.Debug.WriteLine($"LoadUntilMinAsync: appended; _posts.Count={_posts.Count}; _postsHasMore={_postsHasMore}");
 
@@ -724,8 +801,9 @@ namespace HNReader
 
 				if (!result.Success)
 				{
-					await RunOnUiAsync(async () => await ShowErrorDialog(result.ErrorMessage ?? "Unknown error."));
-					return false;
+					var loaded = await LoadPostsCacheAsync().ConfigureAwait(false);
+					if (!loaded)
+						await RunOnUiAsync(async () => await ShowErrorDialog(result.ErrorMessage ?? "Unknown error."));
 				}
 
 				// keep appending batches until we reach the minimum or run out
@@ -745,9 +823,7 @@ namespace HNReader
 					_postsOffset += slice.Count;
 					_postsHasMore = slice.Count >= PostsBatchSize && result.Posts.Count >= _postsOffset;
 					SaveLastFetchTime(DateTimeOffset.UtcNow);
-#pragma warning disable CS4014
-					await SavePostsCacheAsync().ConfigureAwait(false);
-#pragma warning restore CS4014
+					MarkPostsCacheDirty();
 
 					// if we still need more but the initial result didn't include enough IDs, request more IDs
 					if (_posts.Count < _minInitialPosts && _postsHasMore)
@@ -795,10 +871,7 @@ namespace HNReader
 
 		private async Task StartPostsInitialLoadAsync(bool force = false)
 		{
-			await RunOnUiAsync(() =>
-			{
-				PostsList.ItemsSource = _posts;
-			});
+			await RunOnUiAsync(() => { PostsList.ItemsSource = _posts; });
 
 			_postsOffset = 0;
 			_postsHasMore = true;
@@ -807,37 +880,27 @@ namespace HNReader
 			_postsLoadCts?.Cancel();
 			_postsLoadCts?.Dispose();
 			_postsLoadCts = new CancellationTokenSource();
-			var ct = _postsLoadCts.Token;
 
 			if (!force)
 			{
 				var last = LoadLastFetchTime();
-				var cacheIsFresh = last != DateTimeOffset.MinValue &&
-					(DateTimeOffset.UtcNow - last) < FetchInterval;
 
-				if (cacheIsFresh)
+				if (last != DateTimeOffset.MinValue &&
+					(DateTimeOffset.UtcNow - last) < FetchInterval)
 				{
 					var loaded = await LoadPostsCacheAsync().ConfigureAwait(false);
 					if (loaded)
 					{
-						System.Diagnostics.Debug.WriteLine(
-							$"Loaded {_posts.Count} posts from fresh cache.");
+						System.Diagnostics.Debug.WriteLine($"Loaded {_posts.Count} posts from cache (recent).");
 						return;
 					}
 				}
 			}
 
 			_isFirstLoad = true;
-
 			try
 			{
-				var fetched = await FillInitialPostsAsync(ct);
-				if (!fetched && !force && !ct.IsCancellationRequested)
-				{
-					System.Diagnostics.Debug.WriteLine(
-						"Network fetch failed. Attempting cached posts.");
-					await LoadPostsCacheAsync().ConfigureAwait(false);
-				}
+				await FillInitialPostsAsync(_postsLoadCts!.Token);
 			}
 			finally
 			{
@@ -943,85 +1006,59 @@ namespace HNReader
 				_currentCommentsLoadCts?.Cancel();
 				_currentCommentsLoadCts?.Dispose();
 				_currentCommentsLoadCts = new CancellationTokenSource();
-
 				var ct = _currentCommentsLoadCts.Token;
-
-				await RunOnUiAsync(() =>
-				{
-					_ephemeralPost = null;
-					_ephemeralCommentId = null;
-
-					Comments.Clear();
-					CommentsTree.RootNodes.Clear();
-				});
 
 				var info = await client.GetItemInfoAsync(id.Value, ct).ConfigureAwait(false);
 
 				if (string.Equals(info.Type, "story", StringComparison.OrdinalIgnoreCase))
 				{
-					var post = await client.GetItemAsync(id.Value, ct)
-						.ConfigureAwait(false);
-
+					var post = await client.GetItemAsync(id.Value, ct).ConfigureAwait(false);
 					if (post == null)
 					{
 						await RunOnUiAsync(async () =>
-							await ShowErrorDialog(
-								$"Failed to load HN item {id.Value}."));
-
+							await ShowErrorDialog($"Failed to load HN item {id.Value}."));
 						return;
 					}
 
-					_ephemeralPost = post;
-					_ephemeralCommentId = null;
+					_currentPost = post;
+					_currentIsEphemeral = true;
+					_currentFocusCommentId = null;
 
-					await LoadPostContentAsync(
-						post,
-						isEphemeral: true,
-						focusCommentId: null,
-						ct);
-
+					await LoadPostContentAsync(post, true, null, ct);
 					return;
 				}
 
 				if (string.Equals(info.Type, "comment", StringComparison.OrdinalIgnoreCase))
 				{
-					var (story, commentId) =
-						await client.GetStoryContextAsync(id.Value, ct)
-							.ConfigureAwait(false);
-
+					var (story, commentId) = await client.GetStoryContextAsync(id.Value, ct).ConfigureAwait(false);
 					if (story == null)
 					{
 						await RunOnUiAsync(async () =>
-							await ShowErrorDialog(
-								$"Unable to locate the story containing comment {id.Value}."));
-
+							await ShowErrorDialog($"Unable to locate the story containing comment {id.Value}."));
 						return;
 					}
 
-					_ephemeralPost = story;
-					_ephemeralCommentId = commentId;
+					_currentPost = story;
+					_currentIsEphemeral = true;
+					_currentFocusCommentId = commentId;
 
-					await LoadPostContentAsync(
-						story,
-						isEphemeral: true,
-						focusCommentId: commentId,
-						ct);
-
+					await LoadPostContentAsync(story, true, commentId, ct);
 					return;
 				}
 
-				await RunOnUiAsync(async () => await ShowErrorDialog($"HN item {id.Value} is not a readable story or comment."));
+				await RunOnUiAsync(async () =>
+					await ShowErrorDialog($"HN item {id.Value} is not a readable story or comment."));
 			}
 			catch (OperationCanceledException)
 			{
-				// Expected when another link is clicked.
+				// Expected when another content operation supersedes this one.
 			}
 			catch (Exception ex)
 			{
-				System.Diagnostics.Debug.WriteLine(
-					$"HandleLinkClickAsync error: {ex}");
+				System.Diagnostics.Debug.WriteLine($"HandleLinkClickAsync error: {ex}");
 			}
 		}
+
 		private async void RefreshButton_Click(object sender, RoutedEventArgs e)
 		{
 			if (_isRefreshing) return;
@@ -1031,53 +1068,52 @@ namespace HNReader
 
 			try
 			{
-				// 1) Force fetch posts and metadata (existing behavior)
 				await StartPostsInitialLoadAsync(force: true);
 
-				// 2) If there is a currently selected/visible post, force-refresh its comments too
-				//    Determine the "current" post in whatever way your UI uses; common options:
-				//    - PostsList.SelectedItem
-				//    - the post currently displayed in the post-details pane
-				Post? current = null;
-				try
-				{
-					current = PostsList.SelectedItem as Post;
-				}
-				catch { current = null; }
+				var current = _currentPost;
+				var currentIsEphemeral = _currentIsEphemeral;
+				var currentFocusCommentId = _currentFocusCommentId;
 
 				if (current != null)
 				{
 					_currentCommentsLoadCts?.Cancel();
 					_currentCommentsLoadCts?.Dispose();
 					_currentCommentsLoadCts = new CancellationTokenSource();
-
 					var ct = _currentCommentsLoadCts.Token;
 
 					try
 					{
+						if (currentIsEphemeral)
+						{
+							var refreshed = await client.GetItemAsync(current.Id, ct).ConfigureAwait(true);
+							if (refreshed != null)
+							{
+								_currentPost = current = refreshed;
+							}
+						}
+						else
+						{
+							var refreshed = _posts.FirstOrDefault(p => p.Id == current.Id);
+							if (refreshed != null)
+								_currentPost = current = refreshed;
+						}
+
 						await LoadPostContentAsync(
 							current,
-							isEphemeral: false,
-							focusCommentId: null,
+							currentIsEphemeral,
+							currentFocusCommentId,
 							ct,
 							forceNetwork: true);
 					}
-					catch (OperationCanceledException)
-					{
-						// Expected if another load supersedes this one.
-					}
+					catch (OperationCanceledException) { }
 					catch (Exception ex)
 					{
-						System.Diagnostics.Debug.WriteLine(
-							$"Refresh: failed to refresh comments for post {current.Id}: {ex}");
+						System.Diagnostics.Debug.WriteLine($"Refresh content failed for post {current.Id}: {ex}");
 					}
 				}
 
-				// scroll to top of posts list as before
 				if (PostsList.Items?.Count > 0)
-				{
 					PostsList.ScrollIntoView(PostsList.Items[0]);
-				}
 			}
 			finally
 			{
@@ -1127,7 +1163,7 @@ namespace HNReader
 
 			return tcs.Task;
 		}
-		private TreeViewNode? FindNodeByCommentIdRecursive(TreeViewNode node, string id)
+		private static TreeViewNode? FindNodeByCommentIdRecursive(TreeViewNode node, string id)
 		{
 			if (node.Content is Comment c && c.Id.ToString() == id) return node;
 			foreach (var child in node.Children)
@@ -1174,7 +1210,7 @@ namespace HNReader
 				$"FocusCommentInTree: found comment {commentId}.");
 		}
 
-		private TreeViewNode? FindTreeViewNodeByCommentId(TreeViewNode node, int commentId)
+		private static TreeViewNode? FindTreeViewNodeByCommentId(TreeViewNode node, int commentId)
 		{
 			if (node.Content is Comment c && c.Id == commentId)
 				return node;
@@ -1350,8 +1386,9 @@ namespace HNReader
 
 			try
 			{
-				_ephemeralPost = null;
-				_ephemeralCommentId = null;
+				_currentPost = post;
+				_currentIsEphemeral = false;
+				_currentFocusCommentId = null;
 
 				_currentCommentsLoadCts?.Cancel();
 				_currentCommentsLoadCts?.Dispose();
@@ -1359,18 +1396,14 @@ namespace HNReader
 
 				await LoadPostContentAsync(
 					post,
-					isEphemeral: false,
-					focusCommentId: null,
+					false,
+					null,
 					_currentCommentsLoadCts.Token);
 			}
-			catch (OperationCanceledException)
-			{
-				// Expected when another post is selected.
-			}
+			catch (OperationCanceledException) { }
 			catch (Exception ex)
 			{
-				System.Diagnostics.Debug.WriteLine(
-					$"PostsList_ItemClick error: {ex}");
+				System.Diagnostics.Debug.WriteLine($"PostsList_ItemClick error: {ex}");
 			}
 			finally
 			{
@@ -1413,22 +1446,17 @@ namespace HNReader
 
 			await RunOnUiAsync(() =>
 			{
-				PostTitleText.Text =
-					string.IsNullOrWhiteSpace(post.Title)
-						? $"Item {post.Id}"
-						: post.Title;
+				PostTitleText.Text = string.IsNullOrWhiteSpace(post.Title)
+					? $"Item {post.Id}"
+					: post.Title;
 
 				PostMetaText.Text = BuildPostMetaText(post);
 
 				var text = post.Text ?? string.Empty;
 				var hasText = !string.IsNullOrWhiteSpace(text);
 
-				PostTextLabel.Visibility =
-					hasText ? Visibility.Visible : Visibility.Collapsed;
-
-				ArticleBodyScrollViewer.Visibility =
-					hasText ? Visibility.Visible : Visibility.Collapsed;
-
+				PostTextLabel.Visibility = hasText ? Visibility.Visible : Visibility.Collapsed;
+				ArticleBodyScrollViewer.Visibility = hasText ? Visibility.Visible : Visibility.Collapsed;
 				ArticleBody.Blocks.Clear();
 
 				if (hasText)
@@ -1436,42 +1464,24 @@ namespace HNReader
 					try
 					{
 						if (HtmlExtensions.LooksLikeHtml(text))
-						{
-							MinimalHtmlRenderer.RenderToRichTextBlock(
-								ArticleBody,
-								text);
-						}
+							MinimalHtmlRenderer.RenderToRichTextBlock(ArticleBody, text);
 						else
-						{
-							HtmlRendererHelpers.RenderPlainTextWithNewlines(
-								ArticleBody,
-								text);
-						}
+							HtmlRendererHelpers.RenderPlainTextWithNewlines(ArticleBody, text);
 					}
 					catch (Exception ex)
 					{
-						System.Diagnostics.Debug.WriteLine(
-							$"ArticleBody HTML rendering failed: {ex}");
-
-						HtmlRendererHelpers.RenderPlainTextWithNewlines(
-							ArticleBody,
-							text);
+						System.Diagnostics.Debug.WriteLine($"ArticleBody rendering failed: {ex}");
+						HtmlRendererHelpers.RenderPlainTextWithNewlines(ArticleBody, text);
 					}
 
-					FontSizeAdjust.ReapplyGlobalDelta(ArticleBody);
+					FontSizeAdjust.ApplyToElement(ArticleBody, FontSizeAdjust.GetGlobalDelta(RootElement));
 				}
-
-				Comments.Clear();
-
-				foreach (var comment in comments)
-					Comments.Add(comment);
 
 				CommentsTree.RootNodes.Clear();
 
 				foreach (var comment in comments)
 				{
 					var node = BuildNodeFromComment(comment);
-
 					if (node != null)
 						CommentsTree.RootNodes.Add(node);
 				}
@@ -1479,24 +1489,22 @@ namespace HNReader
 				ApplySavedFontAndIndent();
 
 				if (focusCommentId.HasValue)
-				{
 					FocusCommentInTree(focusCommentId.Value);
-				}
 				else
-				{
-					// The TreeView may not have materialized its visual children yet.
-					// Defer the scroll until the next UI/layout pass.
-					_ = DispatcherQueue.TryEnqueue(() =>
-					{
-						ScrollCommentsTreeToTop();
+					_ = DispatcherQueue.TryEnqueue(() => ScrollCommentsTreeToTop());
+			});
+		}
 
-						// One additional pass handles virtualization/materialization.
-						_ = DispatcherQueue.TryEnqueue(() =>
-						{
-							ScrollCommentsTreeToTop();
-						});
-					});
-				}
+		private async Task AppendCommentRootAsync(Comment comment)
+		{
+			if (comment == null)
+				return;
+
+			await RunOnUiAsync(() =>
+			{
+				var node = BuildNodeFromComment(comment);
+				if (node != null)
+					CommentsTree.RootNodes.Add(node);
 			});
 		}
 
@@ -1509,11 +1517,11 @@ namespace HNReader
 		}
 
 		private async Task LoadPostContentAsync(
-	Post post,
-	bool isEphemeral,
-	int? focusCommentId,
-	CancellationToken ct,
-	bool forceNetwork = false)
+			Post post,
+			bool isEphemeral,
+			int? focusCommentId,
+			CancellationToken ct,
+			bool forceNetwork = false)
 		{
 			if (post == null)
 				return;
@@ -1522,46 +1530,180 @@ namespace HNReader
 
 			try
 			{
-				List<Comment> comments = new();
+				List<Comment>? cachedComments = null;
+				DateTimeOffset cachedFetchedUtc = DateTimeOffset.MinValue;
+				bool hasCachedComments = false;
 
-				// For normal posts, prefer the cached tree when available.
-				if (!isEphemeral &&
+				lock (_cachedComments)
+				{
+					if (_cachedComments.TryGetValue(post.Id, out var flat) && flat.Count > 0)
+					{
+						try
+						{
+							cachedComments = ReconstructCommentsFromCache(flat);
+							hasCachedComments = cachedComments.Count > 0;
+						}
+						catch (Exception ex)
+						{
+							System.Diagnostics.Debug.WriteLine(
+								$"ReconstructCommentsFromCache failed for post {post.Id}: {ex}");
+							cachedComments = null;
+							hasCachedComments = false;
+						}
+
+						_cachedCommentFetchUtc.TryGetValue(post.Id, out cachedFetchedUtc);
+					}
+				}
+
+				var cacheIsFresh =
+					hasCachedComments &&
+					cachedFetchedUtc != DateTimeOffset.MinValue &&
+					(DateTimeOffset.UtcNow - cachedFetchedUtc) < CommentCacheFreshness;
+
+				var canUseCachedTree =
 					!forceNetwork &&
-					_cachedComments.TryGetValue(
-						post.Id,
-						out var cachedFlat) &&
-					cachedFlat != null &&
-					cachedFlat.Count > 0)
-				{
-					comments = ReconstructCommentsFromCache(cachedFlat);
+					cacheIsFresh &&
+					cachedComments != null &&
+					(cachedComments.Count > 0 || post.Descendants == 0);
 
-					System.Diagnostics.Debug.WriteLine(
-						$"Using cached comments for post {post.Id}: {cachedFlat.Count} items.");
-				}
-				else
-				{
-					ct.ThrowIfCancellationRequested();
-
-					comments = await client
-						.GetCommentsTreeAsync(post, ct)
-						.ConfigureAwait(false);
-
-					System.Diagnostics.Debug.WriteLine(
-						$"Fetched comments for post {post.Id}: {comments.Count} top-level nodes.");
-				}
-
-				ct.ThrowIfCancellationRequested();
-
+				// Render immediately from cache only when the cached tree is actually usable.
 				await DisplayPostAndCommentsAsync(
 					post,
-					comments,
+					canUseCachedTree ? cachedComments : Array.Empty<Comment>(),
 					isEphemeral,
 					focusCommentId);
 
-				// Keep the fetched tree in the offline cache for normal posts.
-				if (!isEphemeral && comments.Count > 0)
+				if (canUseCachedTree && !isEphemeral)
+					return;
+
+				if (isEphemeral && focusCommentId.HasValue)
 				{
-					CacheCommentTree(post.Id, comments);
+					// The target comment can only be focused after its branch has arrived.
+					await StreamCommentsIntoTreeAsync(post, isEphemeral, ct, focusCommentId.Value, cachedComments, hasCachedComments);
+					return;
+				}
+
+				await StreamCommentsIntoTreeAsync(post, isEphemeral, ct, null, cachedComments, hasCachedComments);
+			}
+			catch (OperationCanceledException)
+			{
+				throw;
+			}
+			catch (Exception ex)
+			{
+				System.Diagnostics.Debug.WriteLine($"LoadPostContentAsync failed for post {post.Id}: {ex}");
+
+				// If the network path fails, fall back to stale cached comments without
+				// treating the cache as fresh for future requests.
+				List<Comment>? stale = null;
+				lock (_cachedComments)
+				{
+					if (_cachedComments.TryGetValue(post.Id, out var flat) && flat.Count > 0)
+						stale = ReconstructCommentsFromCache(flat);
+				}
+
+				if (stale != null && stale.Count > 0)
+				{
+					await DisplayPostAndCommentsAsync(post, stale, isEphemeral, focusCommentId);
+				}
+				else
+				{
+					await RunOnUiAsync(() =>
+					{
+						CommentsTree.RootNodes.Clear();
+						CommentsTree.RootNodes.Add(
+	new TreeViewNode
+	{
+		Content = new Comment
+		{
+			By = "HNReader",
+			Text = "Failed to load comments.",
+			Time = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+			Children = []
+		}
+	});
+					});
+				}
+			}
+			finally
+			{
+				HideCommentsLoadingUI();
+			}
+		}
+
+		private async Task StreamCommentsIntoTreeAsync(
+			Post post,
+			bool isEphemeral,
+			CancellationToken ct,
+			int? focusCommentId,
+			List<Comment>? staleCache,
+			bool hadStaleCache)
+		{
+			try
+			{
+				post = await EnsureKidsAsync(post, ct).ConfigureAwait(false);
+				var live = await client.GetCommentsTreeResultAsync(post, ct).ConfigureAwait(false);
+
+				// A failed live fetch should not be treated the same as a valid empty tree.
+				if (!live.Success)
+				{
+					if (hadStaleCache && staleCache != null && staleCache.Count > 0)
+					{
+						await DisplayPostAndCommentsAsync(post, staleCache, isEphemeral, focusCommentId);
+						return;
+					}
+
+					await RunOnUiAsync(() =>
+					{
+						CommentsTree.RootNodes.Clear();
+						CommentsTree.RootNodes.Add(new TreeViewNode
+						{
+							Content = new Comment
+							{
+								By = "HNReader",
+								Text = "Failed to load comments.",
+								Time = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+								Children = []
+							}
+						});
+					});
+
+					return;
+				}
+
+				// Live fetch succeeded but there are no comments.
+				if (live.Comments.Count == 0)
+				{
+					if (hadStaleCache && staleCache != null && staleCache.Count > 0)
+					{
+						await DisplayPostAndCommentsAsync(post, staleCache, isEphemeral, focusCommentId);
+						return;
+					}
+
+					await RunOnUiAsync(() =>
+					{
+						CommentsTree.RootNodes.Clear();
+						CommentsTree.RootNodes.Add(new TreeViewNode
+						{
+							Content = new Comment
+							{
+								By = "HNReader",
+								Text = post.Descendants > 0 ? "No comments could be loaded." : "No comments.",
+								Time = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+								Children = []
+							}
+						});
+					});
+
+					return;
+				}
+
+				await DisplayPostAndCommentsAsync(post, live.Comments, isEphemeral, focusCommentId);
+
+				if (!isEphemeral && live.Comments.Count > 0)
+				{
+					CacheCommentTree(post.Id, live.Comments);
+					MarkPostsCacheDirty();
 				}
 			}
 			catch (OperationCanceledException)
@@ -1570,32 +1712,31 @@ namespace HNReader
 			}
 			catch (Exception ex)
 			{
-				System.Diagnostics.Debug.WriteLine(
-					$"LoadPostContentAsync failed for post {post.Id}: {ex}");
+				System.Diagnostics.Debug.WriteLine($"Comment stream failed for post {post.Id}: {ex}");
+
+				if (hadStaleCache && staleCache != null && staleCache.Count > 0)
+				{
+					await DisplayPostAndCommentsAsync(post, staleCache, isEphemeral, focusCommentId);
+					return;
+				}
 
 				await RunOnUiAsync(() =>
 				{
-					Comments.Clear();
 					CommentsTree.RootNodes.Clear();
-
-					CommentsTree.RootNodes.Add(
-						new TreeViewNode
+					CommentsTree.RootNodes.Add(new TreeViewNode
+					{
+						Content = new Comment
 						{
-							Content = new TextBlock
-							{
-								Text = "Failed to load comments.",
-								Margin = new Thickness(6)
-							}
-						});
+							By = "HNReader",
+							Text = "Failed to load comments.",
+							Time = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+							Children = []
+						}
+					});
 				});
 			}
-			finally
-			{
-				HideCommentsLoadingUI();
-			}
 		}
-
-		private void CacheCommentTree(int postId, IEnumerable<Comment> comments)
+		private void CacheCommentTree(int postId, IEnumerable<Comment> comments, bool scheduleSave = true)
 		{
 			var flat = new List<CommentCacheItem>();
 
@@ -1611,9 +1752,7 @@ namespace HNReader
 					By = comment.By,
 					Text = comment.Text,
 					Time = comment.Time,
-					ChildIds = comment.Children?
-						.Select(c => c.Id)
-						.ToList()
+					ChildIds = comment.Children?.Select(c => c.Id).ToList()
 				});
 
 				if (comment.Children == null)
@@ -1626,15 +1765,18 @@ namespace HNReader
 			foreach (var root in comments)
 				Walk(root, null);
 
-			lock (_cachedComments)
+			lock (_cacheStateLock)
 			{
 				_cachedComments[postId] = flat;
+				_cachedCommentFetchUtc[postId] = DateTimeOffset.UtcNow;
 			}
+
+			MarkPostsCacheDirty(scheduleSave);
 		}
 
-		private List<Comment> ReconstructCommentsFromCache(List<CommentCacheItem> flat)
+		private static List<Comment> ReconstructCommentsFromCache(List<CommentCacheItem> flat)
 		{
-			if (flat == null || flat.Count == 0) return new List<Comment>();
+			if (flat == null || flat.Count == 0) return [];
 
 			// 1) create Comment instances for every cached item
 			var map = new Dictionary<int, Comment>(flat.Count);
@@ -1646,7 +1788,7 @@ namespace HNReader
 					By = ci.By,
 					Text = ci.Text ?? string.Empty,
 					Time = ci.Time,
-					Children = new List<Comment>()
+					Children = []
 				};
 				map[ci.Id] = c;
 			}
@@ -1738,14 +1880,15 @@ namespace HNReader
 			}
 		}
 
-		private void CommentsTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
+/*		private void CommentsTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
 		{
 			sender.SelectionMode = TreeViewSelectionMode.None; // disable selection highlight
 			return;
-		}
+		} */
+
 		// Build a TreeViewNode from a Comment model (Content = Comment, not a UIElement)
 		// Replace your existing BuildNodeFromComment with this
-		private TreeViewNode? BuildNodeFromComment(Comment c)
+		private static TreeViewNode? BuildNodeFromComment(Comment c)
 		{
 			if (c == null) return null;
 
@@ -1879,7 +2022,7 @@ namespace HNReader
 
 			if (model == null)
 			{
-				FontSizeAdjust.ReapplyGlobalDelta(rtb);
+				FontSizeAdjust.ApplyToElement(rtb, FontSizeAdjust.GetGlobalDelta(RootElement));
 				return;
 			}
 
@@ -1889,7 +2032,7 @@ namespace HNReader
 				// formatting, line breaks, and deleted/dead-comment handling.
 				HtmlExtensions.RenderComment(rtb, model);
 
-				FontSizeAdjust.ReapplyGlobalDelta(rtb);
+				FontSizeAdjust.ApplyToElement(rtb, FontSizeAdjust.GetGlobalDelta(RootElement));
 			}
 			catch (Exception ex)
 			{
@@ -1903,7 +2046,7 @@ namespace HNReader
 						rtb,
 						model.Text ?? string.Empty);
 
-					FontSizeAdjust.ReapplyGlobalDelta(rtb);
+					FontSizeAdjust.ApplyToElement(rtb, FontSizeAdjust.GetGlobalDelta(RootElement));
 				}
 				catch (Exception fallbackEx)
 				{
@@ -1912,133 +2055,158 @@ namespace HNReader
 				}
 			}
 		}
+		private bool _chevronUpdatePending;
+
 		private void CommentsTree_Loaded(object sender, RoutedEventArgs e)
 		{
 			if (sender is FrameworkElement root)
 			{
-				IndentAdjust.ReapplyGlobalIndent(root);
-				// Run once immediately
-				RaiseTreeViewChevronZIndex(root);
-
-				// Re-run when layout changes (virtualization/materialization). Debounced to avoid thrash.
-				root.LayoutUpdated -= CommentsTree_LayoutUpdated;
-				root.LayoutUpdated += CommentsTree_LayoutUpdated;
+				RefreshCommentsTreeVisuals(root);
 			}
 		}
 
 		private void CommentsTree_LayoutUpdated(object? sender, object? e)
 		{
-			// If we're shutting down, ignore layout updates entirely
-			if (_isClosing) return;
+			if (_isClosing || _chevronUpdatePending)
+				return;
 
-			// Debounce: cancel previous scheduled run and schedule a new one 100ms later
-			// Use SafeCancelDispose to avoid cancelling a disposed CTS
-			SafeCancelDispose(ref _chevronCts);
+			if (sender is not FrameworkElement root)
+				return;
 
-			// Create a fresh CTS for the debounce window
-			_chevronCts = new CancellationTokenSource();
-			var token = _chevronCts.Token;
-
-			_ = Task.Run(async () =>
-			{
-				try
+			_chevronUpdatePending = true;
+			_ = DispatcherQueue.TryEnqueue(
+				Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+				() =>
 				{
-					await Task.Delay(100, token).ConfigureAwait(false);
-					// marshal back to UI thread
-					_ = DispatcherQueue.TryEnqueue(() =>
-					{
-						// If closing started while we were waiting, skip the work
-						if (_isClosing) return;
-						// 'sender' may not be a FrameworkElement; guard it
-						if (sender is FrameworkElement root)
-							RaiseTreeViewChevronZIndex(root);
-					});
-				}
-				catch (OperationCanceledException) { /* expected on cancel */ }
-				catch (ObjectDisposedException) { /* defensive: ignore if CTS disposed concurrently */ }
-				catch (Exception ex)
-				{
-					System.Diagnostics.Debug.WriteLine($"CommentsTree_LayoutUpdated background error: {ex}");
-				}
-			}, token);
+					_chevronUpdatePending = false;
+					if (!_isClosing)
+						RefreshCommentsTreeVisuals(root);
+				});
 		}
 
-		private void RaiseTreeViewChevronZIndex(FrameworkElement root)
+		private void RefreshCommentsTreeVisuals(FrameworkElement root)
 		{
-			if (root == null || _isClosing) return;
+			if (root == null || _isClosing)
+				return;
 
-			// Try to obtain a ZIndex DependencyProperty via reflection from likely types
-			DependencyProperty? zIndexDp = null;
-			Type?[] candidateTypes = new[]
-			{
-				// common locations across different WinUI/UWP versions
-				Type.GetType("Microsoft.UI.Xaml.Controls.Panel, Microsoft.UI.Xaml") ?? Type.GetType("Windows.UI.Xaml.Controls.Panel, Windows"),
-				Type.GetType("Microsoft.UI.Xaml.Controls.Canvas, Microsoft.UI.Xaml") ?? Type.GetType("Windows.UI.Xaml.Controls.Canvas, Windows")
-			};
+			ResolveZIndexProperty();
 
-			foreach (var t in candidateTypes)
+			var indentDelta = IndentAdjust.GetGlobalIndentDelta(root);
+			var queue = new Queue<DependencyObject>();
+			queue.Enqueue(root);
+
+			while (queue.Count > 0)
 			{
-				if (t == null) continue;
-				try
+				var current = queue.Dequeue();
+
+				if (current is TreeViewItem treeItem)
 				{
-					var prop = t.GetProperty("ZIndexProperty", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-					if (prop != null)
-					{
-						var val = prop.GetValue(null) as DependencyProperty;
-						if (val != null)
-						{
-							zIndexDp = val;
-							break;
-						}
-					}
+					try { IndentAdjust.ApplyToTreeViewItem(treeItem, indentDelta); } catch { }
 				}
-				catch { /* ignore reflection failures */ }
-			}
 
-			// If we found a ZIndex attached DP, set it on each ToggleButton; otherwise we'll fall back to margin
-			if (zIndexDp != null)
-			{
-				foreach (var t in FindDescendants<ToggleButton>(root))
+				if (current is ToggleButton toggle)
 				{
 					try
 					{
-						t.SetValue(zIndexDp, 1000);
-						t.IsHitTestVisible = true;
+						if (_cachedZIndexProperty != null)
+							toggle.SetValue(_cachedZIndexProperty, 1000);
+
+						toggle.IsHitTestVisible = true;
 					}
-					catch { /* ignore per-element failures */ }
+					catch { }
 				}
-				return;
+
+				int count;
+				try { count = VisualTreeHelper.GetChildrenCount(current); }
+				catch { continue; }
+
+				for (int i = 0; i < count; i++)
+				{
+					try
+					{
+						var child = VisualTreeHelper.GetChild(current, i);
+						if (child != null)
+							queue.Enqueue(child);
+					}
+					catch { }
+				}
 			}
 
-			// Fallback: if no ZIndex DP available, ensure toggles have a small positive margin and are brought visually forward
-			foreach (var t in FindDescendants<ToggleButton>(root))
+			// Canvas.ZIndex is normally available. Preserve the old fallback behavior
+			// only when the attached dependency property could not be resolved.
+			if (_cachedZIndexProperty == null)
+				ApplyChevronFallback(root);
+		}
+
+		private static void ResolveZIndexProperty()
+		{
+			if (_zIndexResolved)
+				return;
+
+			_zIndexResolved = true;
+			try
 			{
-				try
+				var type = typeof(Microsoft.UI.Xaml.Controls.Canvas);
+				var field = type.GetField(
+					"ZIndexProperty",
+					System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+
+				_cachedZIndexProperty = field?.GetValue(null) as DependencyProperty;
+				if (_cachedZIndexProperty == null)
 				{
-					// give the toggle a slight positive margin so it sits visually above content
-					var m = t.Margin;
-					// only increase left if it looks small
-					if (m.Left < 2) t.Margin = new Thickness(m.Left + 2, m.Top, m.Right, m.Bottom);
-
-					// make sure toggle is on top of siblings by reparenting it to the same parent at the end
-					var parent = VisualTreeHelper.GetParent(t) as Panel;
-					if (parent != null)
-					{
-						// move the toggle to the end of the children collection so it renders last
-						try
-						{
-							if (parent.Children.Contains(t))
-							{
-								parent.Children.Remove(t);
-								parent.Children.Add(t);
-							}
-						}
-						catch { /* some parents are not Panel or don't allow manipulation; ignore */ }
-					}
-
-					t.IsHitTestVisible = true;
+					var prop = type.GetProperty(
+						"ZIndexProperty",
+						System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+					_cachedZIndexProperty = prop?.GetValue(null) as DependencyProperty;
 				}
-				catch { /* ignore per-element failures */ }
+			}
+			catch
+			{
+				_cachedZIndexProperty = null;
+			}
+		}
+
+		private static void ApplyChevronFallback(FrameworkElement root)
+		{
+			var queue = new Queue<DependencyObject>();
+			queue.Enqueue(root);
+
+			while (queue.Count > 0)
+			{
+				var current = queue.Dequeue();
+				if (current is ToggleButton toggle)
+				{
+					try
+					{
+						var margin = toggle.Margin;
+						if (margin.Left < 2)
+							toggle.Margin = new Thickness(margin.Left + 2, margin.Top, margin.Right, margin.Bottom);
+
+						var parent = VisualTreeHelper.GetParent(toggle) as Panel;
+						if (parent != null && parent.Children.Contains(toggle))
+						{
+							parent.Children.Remove(toggle);
+							parent.Children.Add(toggle);
+						}
+
+						toggle.IsHitTestVisible = true;
+					}
+					catch { }
+				}
+
+				int count;
+				try { count = VisualTreeHelper.GetChildrenCount(current); }
+				catch { continue; }
+				for (int i = 0; i < count; i++)
+				{
+					try
+					{
+						var child = VisualTreeHelper.GetChild(current, i);
+						if (child != null)
+							queue.Enqueue(child);
+					}
+					catch { }
+				}
 			}
 		}
 
@@ -2073,34 +2241,8 @@ namespace HNReader
 			catch { /* ignore during shutdown */ }
 		}
 
-		private static IEnumerable<T> FindDescendants<T>(DependencyObject root) where T : DependencyObject
-		{
-			if (root == null) yield break;
-			var q = new Queue<DependencyObject>();
-			q.Enqueue(root);
-
-			while (q.Count > 0)
-			{
-				var cur = q.Dequeue();
-				if (cur is T t) yield return t;
-
-				int c = 0;
-				try { c = VisualTreeHelper.GetChildrenCount(cur); }
-				catch { continue; }
-
-				for (int i = 0; i < c; i++)
-				{
-					DependencyObject? child = null;
-					try { child = VisualTreeHelper.GetChild(cur, i); }
-					catch { continue; }
-					if (child != null) q.Enqueue(child);
-				}
-			}
-		}
-
 		private async void SaveOfflineButton_Click(object sender, RoutedEventArgs e)
 		{
-			// disable button while saving
 			try
 			{
 				SaveOfflineButton.IsEnabled = false;
@@ -2114,13 +2256,18 @@ namespace HNReader
 
 			try
 			{
-				await FetchAndCacheAllCommentsAsync(ct);
-				// persist posts+comments to disk
-				await SavePostsCacheAsync().ConfigureAwait(false);
+				await FetchAndCacheAllCommentsAsync(ct).ConfigureAwait(false);
+				await SavePostsCacheAsync(force: true).ConfigureAwait(false);
 				System.Diagnostics.Debug.WriteLine("SaveOffline: posts+comments cached.");
 			}
-			catch (OperationCanceledException) { System.Diagnostics.Debug.WriteLine("SaveOffline cancelled."); }
-			catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"SaveOffline failed: {ex}"); }
+			catch (OperationCanceledException)
+			{
+				System.Diagnostics.Debug.WriteLine("SaveOffline cancelled.");
+			}
+			catch (Exception ex)
+			{
+				System.Diagnostics.Debug.WriteLine($"SaveOffline failed: {ex}");
+			}
 			finally
 			{
 				try { SaveOfflineButton.IsEnabled = true; } catch { }
@@ -2131,11 +2278,10 @@ namespace HNReader
 
 		private async Task FetchAndCacheAllCommentsAsync(CancellationToken ct)
 		{
-			// limit concurrency to avoid hammering network
 			const int MaxParallel = 6;
 			var semaphore = new SemaphoreSlim(MaxParallel, MaxParallel);
 
-			var postsSnapshot = _posts.ToList(); // snapshot of current posts
+			var postsSnapshot = _posts.ToList();
 			var tasks = new List<Task>();
 
 			foreach (var post in postsSnapshot)
@@ -2145,38 +2291,41 @@ namespace HNReader
 				{
 					try
 					{
-						// fetch comments tree on background thread
-						List<Comment> tree;
+						HNClient.CommentTreeResult treeResult;
 						try
 						{
-							tree = await client.GetCommentsTreeAsync(post, ct).ConfigureAwait(false);
+							var hydratedPost = await EnsureKidsAsync(post, ct).ConfigureAwait(false);
+							treeResult = await client.GetCommentsTreeResultAsync(hydratedPost, ct).ConfigureAwait(false);
+						}
+						catch (OperationCanceledException)
+						{
+							throw;
 						}
 						catch
 						{
-							tree = new List<Comment>();
+							treeResult = new HNClient.CommentTreeResult
+							{
+								Success = false,
+								IsNetworkError = true,
+								Comments = []
+							};
 						}
 
-						// flatten tree into CommentCacheItem list with parent/child ids
-						// build flat list of CommentCacheItem from the comment tree
+						var tree = treeResult.Comments;
+
 						var flat = new List<CommentCacheItem>();
 
 						void Walk(Comment c, int? parent)
 						{
 							if (c == null) return;
 
-							// use the Comment.Id directly
-							var id = c.Id;
-
-							// prefer child ids from the Children collection
 							List<int>? childIds = null;
 							if (c.Children != null && c.Children.Count > 0)
-							{
-								childIds = c.Children.Select(ch => ch.Id).ToList();
-							}
+								childIds = [.. c.Children.Select(ch => ch.Id)];
 
 							flat.Add(new CommentCacheItem
 							{
-								Id = id,
+								Id = c.Id,
 								ParentId = parent,
 								By = c.By,
 								Text = c.Text,
@@ -2184,26 +2333,34 @@ namespace HNReader
 								ChildIds = childIds
 							});
 
-							// recurse into children
-							if (c.Children != null) foreach (var child in c.Children) Walk(child, id);
+							if (c.Children != null)
+								foreach (var child in c.Children)
+									Walk(child, c.Id);
 						}
 
-						// If the client returned a tree, walk each top-level node
-						if (tree != null && tree.Count > 0) foreach (var top in tree) Walk(top, null);
+						if (tree != null && tree.Count > 0)
+							foreach (var top in tree)
+								Walk(top, null);
 
-						// store into in-memory cache (thread-safe via lock)
-						lock (_cachedComments)
+						if (treeResult.Success && tree.Count > 0)
 						{
-							_cachedComments[(int)post.Id] = flat;
+							lock (_cacheStateLock)
+							{
+								_cachedComments[(int)post.Id] = flat;
+								_cachedCommentFetchUtc[(int)post.Id] = DateTimeOffset.UtcNow;
+							}
 						}
-						var descendantsCount = flat?.Count ?? 0;
+
+						var descendantsCount = flat.Count;
 						await RunOnUiAsync(() =>
 						{
 							var existing = _posts.FirstOrDefault(x => x.Id == post.Id);
-							existing?.Descendants = descendantsCount;
+							if (existing != null)
+								existing.Descendants = descendantsCount;
 						});
+
 						SaveLastFetchTime(DateTimeOffset.UtcNow);
-						_ = SavePostsCacheAsync();
+						MarkPostsCacheDirty(scheduleSave: false);
 					}
 					catch (Exception ex)
 					{
@@ -2215,6 +2372,7 @@ namespace HNReader
 					}
 				}, ct));
 			}
+
 			await Task.WhenAll(tasks).ConfigureAwait(false);
 		}
 	}

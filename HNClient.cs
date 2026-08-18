@@ -141,56 +141,13 @@ namespace HNReader
 			Post post,
 			CancellationToken ct = default)
 		{
-			if (post?.Kids == null || post.Kids.Count == 0)
-				return new List<Comment>();
+			return (await GetCommentsTreeResultAsync(post, ct).ConfigureAwait(false)).Comments;
+		}
 
-			var rawById = new Dictionary<int, CommentRaw>();
-			var pending = new Queue<int>();
-			var seen = new HashSet<int>();
-
-			foreach (var kidId in post.Kids)
-			{
-				if (seen.Add(kidId))
-					pending.Enqueue(kidId);
-			}
-
-			while (pending.Count > 0)
-			{
-				ct.ThrowIfCancellationRequested();
-
-				var batch = new List<int>(Math.Min(CommentFetchBatchSize, pending.Count));
-				while (pending.Count > 0 && batch.Count < CommentFetchBatchSize)
-					batch.Add(pending.Dequeue());
-
-				var tasks = batch
-					.Select(id => FetchCommentRawSafeAsync(id, ct))
-					.ToArray();
-
-				var raws = await Task.WhenAll(tasks).ConfigureAwait(false);
-
-				for (var i = 0; i < raws.Length; i++)
-				{
-					ct.ThrowIfCancellationRequested();
-
-					var raw = raws[i];
-					if (raw == null)
-						continue;
-
-					rawById[raw.Id] = raw;
-
-					if (raw.Kids == null)
-						continue;
-
-					foreach (var childId in raw.Kids)
-					{
-						if (seen.Add(childId))
-							pending.Enqueue(childId);
-					}
-				}
-			}
-
-			// Convert the fetched raw graph to the public Comment graph once.
-			// Memoization prevents rebuilding the same subtree repeatedly.
+		private static List<Comment> BuildCommentRoots(
+			Dictionary<int, CommentRaw> rawById,
+			IEnumerable<int> rootIds)
+		{
 			var built = new Dictionary<int, List<Comment>>();
 			var building = new HashSet<int>();
 
@@ -200,11 +157,10 @@ namespace HNReader
 					return cached;
 
 				if (!rawById.TryGetValue(id, out var raw))
-					return new List<Comment>();
+					return [];
 
-				// Defensive cycle guard; HN's tree should not contain cycles.
 				if (!building.Add(id))
-					return new List<Comment>();
+					return [];
 
 				var children = new List<Comment>();
 				if (raw.Kids != null)
@@ -245,14 +201,11 @@ namespace HNReader
 				return result;
 			}
 
-			var resultRoots = new List<Comment>();
-			foreach (var rootId in post.Kids)
-			{
-				ct.ThrowIfCancellationRequested();
-				resultRoots.AddRange(BuildNodes(rootId));
-			}
+			var roots = new List<Comment>();
+			foreach (var rootId in rootIds)
+				roots.AddRange(BuildNodes(rootId));
 
-			return resultRoots;
+			return roots;
 		}
 
 		private async Task<CommentRaw?> FetchCommentRawSafeAsync(
@@ -331,7 +284,7 @@ namespace HNReader
 			}
 		}
 
-		private async Task<T?> GetAsync<T>(string path, CancellationToken ct)
+		private static async Task<T?> GetAsync<T>(string path, CancellationToken ct)
 		{
 			using var resp = await http.GetAsync(
 				path,
@@ -405,6 +358,19 @@ namespace HNReader
 			}
 		}
 
+		private sealed class CommentRawFetchResult
+		{
+			public CommentRaw? Raw { get; init; }
+			public bool IsNetworkError { get; init; }
+		}
+
+		public sealed class CommentTreeResult
+		{
+			public bool Success { get; init; }
+			public bool IsNetworkError { get; init; }
+			public List<Comment> Comments { get; init; } = [];
+		}
+
 		private sealed class HnItemRaw
 		{
 			public int Id { get; set; }
@@ -435,17 +401,173 @@ namespace HNReader
 			public bool? Dead { get; set; }
 		}
 
-		// Compatibility API. Phase 2 will make the interactive path consume this
-		// incrementally; for now it preserves the same public surface.
+		/// <summary>
+		/// Streams top-level comment branches one at a time. Each yielded comment
+		/// contains its complete descendant tree, preserving the current TreeView model
+		/// while allowing the UI to start rendering before the entire thread is fetched.
+		/// </summary>
 		public async IAsyncEnumerable<Comment> GetCommentsStreamAsync(
 			Post post,
 			[System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
 		{
-			var comments = await GetCommentsTreeAsync(post, ct).ConfigureAwait(false);
-			foreach (var comment in comments)
+			if (post?.Kids == null || post.Kids.Count == 0)
+				yield break;
+
+			foreach (var rootId in post.Kids)
 			{
 				ct.ThrowIfCancellationRequested();
-				yield return comment;
+
+				var roots = await GetCommentBranchAsync(rootId, ct).ConfigureAwait(false);
+				foreach (var comment in roots)
+				{
+					ct.ThrowIfCancellationRequested();
+					yield return comment;
+				}
+			}
+		}
+
+		private async Task<List<Comment>> GetCommentBranchAsync(
+			int rootId,
+			CancellationToken ct)
+		{
+			var rawById = new Dictionary<int, CommentRaw>();
+			var pending = new Queue<int>();
+			var seen = new HashSet<int>();
+
+			pending.Enqueue(rootId);
+			seen.Add(rootId);
+
+			while (pending.Count > 0)
+			{
+				ct.ThrowIfCancellationRequested();
+
+				var batch = new List<int>(Math.Min(CommentFetchBatchSize, pending.Count));
+				while (pending.Count > 0 && batch.Count < CommentFetchBatchSize)
+					batch.Add(pending.Dequeue());
+
+				var tasks = batch.Select(id => FetchCommentRawSafeAsync(id, ct)).ToArray();
+				var raws = await Task.WhenAll(tasks).ConfigureAwait(false);
+
+				foreach (var raw in raws)
+				{
+					ct.ThrowIfCancellationRequested();
+					if (raw == null)
+						continue;
+
+					rawById[raw.Id] = raw;
+
+					if (raw.Kids == null)
+						continue;
+
+					foreach (var childId in raw.Kids)
+					{
+						if (seen.Add(childId))
+							pending.Enqueue(childId);
+					}
+				}
+			}
+
+			return BuildCommentRoots(rawById, [rootId]);
+		}
+
+		public async Task<CommentTreeResult> GetCommentsTreeResultAsync(
+	Post post,
+	CancellationToken ct = default)
+		{
+			if (post?.Kids == null || post.Kids.Count == 0)
+			{
+				return new CommentTreeResult
+				{
+					Success = true,
+					IsNetworkError = false,
+					Comments = []
+				};
+			}
+
+			var rawById = new Dictionary<int, CommentRaw>();
+			var pending = new Queue<int>();
+			var seen = new HashSet<int>();
+			var networkError = false;
+
+			foreach (var kidId in post.Kids)
+			{
+				if (seen.Add(kidId))
+					pending.Enqueue(kidId);
+			}
+
+			while (pending.Count > 0)
+			{
+				ct.ThrowIfCancellationRequested();
+
+				var batch = new List<int>(Math.Min(CommentFetchBatchSize, pending.Count));
+				while (pending.Count > 0 && batch.Count < CommentFetchBatchSize)
+					batch.Add(pending.Dequeue());
+
+				var tasks = batch
+					.Select(id => FetchCommentRawResultAsync(id, ct))
+					.ToArray();
+
+				var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+
+				foreach (var item in results)
+				{
+					ct.ThrowIfCancellationRequested();
+
+					if (item.IsNetworkError)
+						networkError = true;
+
+					var raw = item.Raw;
+					if (raw == null)
+						continue;
+
+					rawById[raw.Id] = raw;
+
+					if (raw.Kids == null)
+						continue;
+
+					foreach (var childId in raw.Kids)
+					{
+						if (seen.Add(childId))
+							pending.Enqueue(childId);
+					}
+				}
+			}
+
+			return new CommentTreeResult
+			{
+				Success = !networkError,
+				IsNetworkError = networkError,
+				Comments = BuildCommentRoots(rawById, post.Kids)
+			};
+		}
+
+		private async Task<CommentRawFetchResult> FetchCommentRawResultAsync(
+	int id,
+	CancellationToken ct)
+		{
+			try
+			{
+				return new CommentRawFetchResult
+				{
+					Raw = await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, ct)
+						.ConfigureAwait(false),
+					IsNetworkError = false
+				};
+			}
+			catch (OperationCanceledException) when (ct.IsCancellationRequested)
+			{
+				throw;
+			}
+			catch (Exception ex)
+			{
+				System.Diagnostics.Debug.WriteLine(
+					$"Comment {id} fetch failed: {ex.Message}");
+
+				return new CommentRawFetchResult
+				{
+					Raw = null,
+					IsNetworkError = true
+				};
 			}
 		}
 	}
@@ -458,7 +580,7 @@ namespace HNReader
 		public string? By { get; set; }
 		public string Text { get; set; } = string.Empty;
 		public long Time { get; set; }
-		public List<Comment> Children { get; set; } = new List<Comment>();
+		public List<Comment> Children { get; set; } = [];
 		public int Descendants { get; set; } = 0;
 		public int? Score { get; set; }
 		public bool IsExpanded { get; set; } = true;
@@ -491,7 +613,7 @@ namespace HNReader
 		public bool Success { get; private set; }
 		public bool IsNetworkError { get; private set; }
 		public string? ErrorMessage { get; private set; }
-		public List<Post> Posts { get; private set; } = new();
+		public List<Post> Posts { get; private set; } = [];
 
 		private HNResult() { }
 

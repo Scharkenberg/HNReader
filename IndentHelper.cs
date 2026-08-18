@@ -29,6 +29,20 @@ namespace HNReader
 				typeof(IndentAdjust),
 				new PropertyMetadata(null));
 
+		private static readonly DependencyProperty HeaderPresenterProperty =
+			DependencyProperty.RegisterAttached(
+				"HeaderPresenter",
+				typeof(FrameworkElement),
+				typeof(IndentAdjust),
+				new PropertyMetadata(null));
+
+		private static readonly DependencyProperty DepthProperty =
+			DependencyProperty.RegisterAttached(
+				"Depth",
+				typeof(int?),
+				typeof(IndentAdjust),
+				new PropertyMetadata(null));
+
 		public static void SetGlobalIndentDelta(DependencyObject obj, double value) =>
 			obj.SetValue(GlobalIndentDeltaProperty, value);
 
@@ -47,35 +61,35 @@ namespace HNReader
 		private static Thickness? GetOriginalPadding(DependencyObject obj) =>
 			(Thickness?)obj.GetValue(OriginalPaddingProperty);
 
-		private static void OnGlobalIndentDeltaChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
-		{
-			if (d is not FrameworkElement root) return;
+		private static void SetHeaderPresenter(DependencyObject obj, FrameworkElement? value) =>
+			obj.SetValue(HeaderPresenterProperty, value);
 
-			_ = root.DispatcherQueue.TryEnqueue(() =>
-			{
-				try
-				{
-					root.Loaded -= Root_Loaded;
-					root.Loaded += Root_Loaded;
-					ApplyIndentToTree(root, (double)e.NewValue);
-				}
-				catch (Exception ex)
-				{
-					System.Diagnostics.Debug.WriteLine($"IndentAdjust.OnGlobalIndentDeltaChanged: {ex}");
-				}
-			});
+		private static FrameworkElement? GetHeaderPresenter(DependencyObject obj) =>
+			obj.GetValue(HeaderPresenterProperty) as FrameworkElement;
+
+		private static void SetDepth(DependencyObject obj, int? value) =>
+			obj.SetValue(DepthProperty, value);
+
+		private static int? GetDepth(DependencyObject obj) =>
+			(int?)obj.GetValue(DepthProperty);
+
+		private static void OnGlobalIndentDeltaChanged(
+			DependencyObject d,
+			DependencyPropertyChangedEventArgs e)
+		{
+			if (d is FrameworkElement root)
+				ApplyRealizedTree(root, (double)e.NewValue);
 		}
 
-		private static void Root_Loaded(object? sender, RoutedEventArgs e)
+		public static void ApplyRealizedTree(FrameworkElement root)
 		{
-			if (sender is FrameworkElement root)
-			{
-				var delta = GetGlobalIndentDelta(root);
-				ApplyIndentToTree(root, delta);
-			}
+			if (root == null)
+				return;
+
+			ApplyRealizedTree(root, GetGlobalIndentDelta(root));
 		}
 
-		private static void ApplyIndentToTree(FrameworkElement root, double delta)
+		private static void ApplyRealizedTree(FrameworkElement root, double delta)
 		{
 			var queue = new Queue<DependencyObject>();
 			queue.Enqueue(root);
@@ -84,163 +98,144 @@ namespace HNReader
 			{
 				var current = queue.Dequeue();
 
-				// If this is a TreeViewItem, adjust its header visual
-				if (current is TreeViewItem tvi)
-				{
-					try
-					{
-						ApplyToTreeViewItem(tvi, delta);
-					}
-					catch (Exception ex)
-					{
-						System.Diagnostics.Debug.WriteLine($"IndentAdjust: error adjusting TreeViewItem: {ex}");
-					}
-				}
+				if (current is TreeViewItem item)
+					ApplyToTreeViewItem(item, delta);
 
-				int count = 0;
-				try
-				{
-					count = VisualTreeHelper.GetChildrenCount(current);
-				}
-				catch (Exception ex)
-				{
-					System.Diagnostics.Debug.WriteLine($"IndentAdjust: GetChildrenCount failed for {current?.GetType().FullName}: {ex}");
-					continue;
-				}
+				int count;
+				try { count = VisualTreeHelper.GetChildrenCount(current); }
+				catch { continue; }
 
 				for (int i = 0; i < count; i++)
 				{
 					try
 					{
 						var child = VisualTreeHelper.GetChild(current, i);
-						if (child != null) queue.Enqueue(child);
+						if (child != null)
+							queue.Enqueue(child);
 					}
-					catch (Exception ex)
-					{
-						System.Diagnostics.Debug.WriteLine($"IndentAdjust: GetChild({i}) failed for {current?.GetType().FullName}: {ex}");
-					}
+					catch { }
 				}
 			}
 		}
 
-		// New: compute depth by walking up parent chain and then adjust a concrete visual inside the TreeViewItem
-		private static void ApplyToTreeViewItem(TreeViewItem tvi, double delta)
+		public static void ApplyToTreeViewItem(TreeViewItem item, double delta)
 		{
-			if (tvi == null) return;
+			if (item == null)
+				return;
 
-			// compute depth by counting ancestor TreeViewItem nodes
-			int depth = 0;
-			DependencyObject parent = VisualTreeHelper.GetParent(tvi);
-			while (parent != null)
+			var depth = GetDepth(item);
+			if (!depth.HasValue)
 			{
-				if (parent is TreeViewItem) depth++;
-				parent = VisualTreeHelper.GetParent(parent);
+				int computed = 0;
+				DependencyObject? parent = VisualTreeHelper.GetParent(item);
+				while (parent != null)
+				{
+					if (parent is TreeViewItem)
+						computed++;
+
+					parent = VisualTreeHelper.GetParent(parent);
+				}
+
+				SetDepth(item, computed);
+				depth = computed;
 			}
 
-			// If depth is 0 (top-level), you may want to skip or use depth-1 mapping; adjust as needed.
-			// Compute indent offset: delta * depth
-			var indent = delta * depth;
+			var headerPresenter = GetHeaderPresenter(item);
+			if (headerPresenter == null)
+			{
+				headerPresenter = FindDescendant<ContentPresenter>(item)
+					?? FindDescendant<FrameworkElement>(item);
 
-			// Try to find a header presenter (ContentPresenter or first FrameworkElement child) to adjust Margin
-			var headerPresenter = FindDescendant<ContentPresenter>(tvi) as FrameworkElement
-								  ?? FindDescendant<FrameworkElement>(tvi);
+				if (headerPresenter != null)
+					SetHeaderPresenter(item, headerPresenter);
+			}
+
+			var amount = delta * depth.Value;
 
 			if (headerPresenter != null)
 			{
-				// store original margin once
-				var origMargin = GetOriginalMargin(headerPresenter);
-				if (origMargin == null)
+				var original = GetOriginalMargin(headerPresenter);
+				if (!original.HasValue)
 				{
-					try
-					{
-						SetOriginalMargin(headerPresenter, headerPresenter.Margin);
-						origMargin = headerPresenter.Margin;
-					}
-					catch (Exception ex)
-					{
-						System.Diagnostics.Debug.WriteLine($"IndentAdjust: failed to read headerPresenter.Margin: {ex}");
-						origMargin = new Thickness(0);
-						SetOriginalMargin(headerPresenter, origMargin);
-					}
+					original = headerPresenter.Margin;
+					SetOriginalMargin(headerPresenter, original);
 				}
 
-				var newLeft = origMargin.Value.Left + indent;
-				if (double.IsNaN(newLeft) || double.IsInfinity(newLeft)) newLeft = origMargin.Value.Left;
-				if (newLeft < 0) newLeft = 0;
+				var newLeft = original.Value.Left + amount;
+				if (double.IsNaN(newLeft) || double.IsInfinity(newLeft))
+					newLeft = original.Value.Left;
 
-				var newMargin = new Thickness(newLeft, origMargin.Value.Top, origMargin.Value.Right, origMargin.Value.Bottom);
-				try
-				{
-					headerPresenter.Margin = newMargin;
-				}
-				catch (Exception ex)
-				{
-					System.Diagnostics.Debug.WriteLine($"IndentAdjust: failed to set headerPresenter.Margin: {ex}");
-				}
+				newLeft = Math.Max(0, newLeft);
+
+				headerPresenter.Margin = new Thickness(
+					newLeft,
+					original.Value.Top,
+					original.Value.Right,
+					original.Value.Bottom);
 
 				return;
 			}
 
-			// Fallback: if no presenter found, try to set Padding on the TreeViewItem itself (if available)
 			try
 			{
-				// store original padding once
-				var origPad = GetOriginalPadding(tvi);
-				if (origPad == null)
+				var originalPadding = GetOriginalPadding(item);
+				if (!originalPadding.HasValue)
 				{
-					try
-					{
-						// TreeViewItem may expose Padding (Control), try to read it
-						var padObj = typeof(Control).GetProperty("Padding")?.GetValue(tvi);
-						var pad = (padObj is Thickness th) ? th : new Thickness(0);
-						SetOriginalPadding(tvi, pad);
-						origPad = pad;
-					}
-					catch { origPad = new Thickness(0); SetOriginalPadding(tvi, origPad); }
+					var property = typeof(Control).GetProperty("Padding");
+					var padding = property?.GetValue(item) is Thickness th
+						? th
+						: new Thickness(0);
+
+					SetOriginalPadding(item, padding);
+					originalPadding = padding;
 				}
 
-				var newLeftPad = origPad.Value.Left + indent;
-				if (double.IsNaN(newLeftPad) || double.IsInfinity(newLeftPad)) newLeftPad = origPad.Value.Left;
-				if (newLeftPad < 0) newLeftPad = 0;
+				var newLeft = Math.Max(
+					0,
+					originalPadding.Value.Left + amount);
 
-				var newPad = new Thickness(newLeftPad, origPad.Value.Top, origPad.Value.Right, origPad.Value.Bottom);
-
-				// try to set Padding via reflection to avoid compile-time dependency
-				var paddingProp = typeof(Control).GetProperty("Padding");
-				if (paddingProp != null && paddingProp.CanWrite)
+				var setter = typeof(Control).GetProperty("Padding");
+				if (setter?.CanWrite == true)
 				{
-					paddingProp.SetValue(tvi, newPad);
+					setter.SetValue(
+						item,
+						new Thickness(
+							newLeft,
+							originalPadding.Value.Top,
+							originalPadding.Value.Right,
+							originalPadding.Value.Bottom));
 				}
 			}
-			catch (Exception ex)
-			{
-				System.Diagnostics.Debug.WriteLine($"IndentAdjust: fallback padding set failed: {ex}");
-			}
+			catch { }
 		}
 
 		private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
 		{
-			if (root == null) return null;
-			var q = new Queue<DependencyObject>();
-			q.Enqueue(root);
+			if (root == null)
+				return null;
 
-			while (q.Count > 0)
+			var queue = new Queue<DependencyObject>();
+			queue.Enqueue(root);
+
+			while (queue.Count > 0)
 			{
-				var cur = q.Dequeue();
-				if (cur is T t) return t;
+				var current = queue.Dequeue();
+				if (current is T result)
+					return result;
 
-				int c = 0;
-				try { c = VisualTreeHelper.GetChildrenCount(cur); }
+				int count;
+				try { count = VisualTreeHelper.GetChildrenCount(current); }
 				catch { continue; }
 
-				for (int i = 0; i < c; i++)
+				for (int i = 0; i < count; i++)
 				{
 					try
 					{
-						var child = VisualTreeHelper.GetChild(cur, i);
-						if (child != null) q.Enqueue(child);
+						var child = VisualTreeHelper.GetChild(current, i);
+						if (child != null)
+							queue.Enqueue(child);
 					}
-					catch { /* ignore individual child errors */ }
+					catch { }
 				}
 			}
 
@@ -249,9 +244,7 @@ namespace HNReader
 
 		public static void ReapplyGlobalIndent(FrameworkElement root)
 		{
-			if (root == null) return;
-			var delta = GetGlobalIndentDelta(root);
-			ApplyIndentToTree(root, delta);
+			ApplyRealizedTree(root);
 		}
 	}
 }
