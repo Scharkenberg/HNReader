@@ -166,6 +166,69 @@ public sealed class HnBackendClient : IAsyncDisposable
 	public Task<HNResult> GetTopStoriesAsync(int limit = 50, CancellationToken ct = default)
 		=> _reader.GetTopStoriesAsync(limit, ct);
 
+	public async Task ApplyVoteInfoAsync(
+	Post post,
+	CancellationToken ct = default)
+	{
+		if (!_web.GetCookies().Any())
+		{
+			post.CanVote = false;
+			post.HasUpvoted = false;
+			return;
+		}
+
+		var html = await _web.GetStringAsync(
+			$"item?id={post.Id}",
+			ct).ConfigureAwait(false);
+
+		if (_web.TryGetVoteInfo(
+			html,
+			post.Id,
+			out var auth,
+			out var hasUpvoted))
+		{
+			post.CanVote = true;
+			post.HasUpvoted = hasUpvoted;
+		}
+		else
+		{
+			post.CanVote = false;
+			post.HasUpvoted = false;
+		}
+	}
+
+	public async Task ApplyPostVoteInfoAsync(
+		Post post,
+		CancellationToken ct = default)
+	{
+		ArgumentNullException.ThrowIfNull(post);
+
+		if (!IsAuthenticated)
+		{
+			post.CanVote = false;
+			post.HasUpvoted = false;
+			return;
+		}
+
+		var html = await _web.GetStringAsync(
+			$"item?id={post.Id}",
+			ct).ConfigureAwait(false);
+
+		if (_web.TryGetVoteInfo(
+			html,
+			post.Id,
+			out _,
+			out var hasUpvoted))
+		{
+			post.CanVote = true;
+			post.HasUpvoted = hasUpvoted;
+		}
+		else
+		{
+			post.CanVote = false;
+			post.HasUpvoted = false;
+		}
+	}
 	public ValueTask DisposeAsync()
 	{
 		_web.Dispose();
@@ -375,23 +438,39 @@ public sealed class HnWriteService
 			}
 
 			var how = up ? "up" : "un";
-			var voteUri = new Uri(_web.BaseUri, $"vote?id={itemId}&how={how}&auth={Uri.EscapeDataString(auth)}");
+			var gotoValue = Uri.EscapeDataString($"item?id={itemId}");
 
-			var response = await _web.GetStringAsync(voteUri.AbsoluteUri, ct).ConfigureAwait(false);
-			await Task.Delay(_throttleDelay, ct).ConfigureAwait(false);
+			var voteUri = new Uri(
+				_web.BaseUri,
+				$"vote?id={itemId}" +
+				$"&how={how}" +
+				$"&auth={Uri.EscapeDataString(auth)}" +
+				$"&goto={gotoValue}");
 
-			// The vote endpoint redirects back to a page that reflects the new state.
-			// Re-read that state instead of assuming a 2xx response means the vote took;
-			// HN silently no-ops instead of erroring on things like voting on your own post.
+			await _web.GetStringAsync(voteUri.AbsoluteUri, ct).ConfigureAwait(false);
+
+			await Task.Delay(_throttleDelay, ct)
+				.ConfigureAwait(false);
+
+			var verificationHtml =
+				await _web.GetStringAsync(
+					$"item?id={itemId}",
+					ct)
+				.ConfigureAwait(false);
+
 			var confirmed =
-				_web.TryGetVoteInfo(response, itemId, out _, out var nowUpvoted) &&
+				_web.TryGetVoteInfo(
+					verificationHtml,
+					itemId,
+					out _,
+					out var nowUpvoted) &&
 				nowUpvoted == up;
 
 			return new HnActionResult(
 				confirmed,
 				HttpStatusCode.OK,
-				confirmed ? "Vote submitted." : "Vote request sent, but the resulting page didn't confirm the new state.",
-				response,
+				confirmed ? "Vote submitted." : "Vote request sent, but the new state could not be confirmed.",
+				verificationHtml,
 				voteUri,
 				HasUpvoted: confirmed ? up : (bool?)null);
 		}
@@ -740,13 +819,20 @@ internal static class HnHtmlFormHelper
 
 		return result;
 	}
-	internal static bool TryGetVoteInfo(string html, int itemId, out string auth, out bool hasUpvoted)
+	internal static bool TryGetVoteInfo(
+		string html,
+		int itemId,
+		out string auth,
+		out bool hasUpvoted)
 	{
 		auth = string.Empty;
 		hasUpvoted = false;
 
 		if (string.IsNullOrWhiteSpace(html))
 			return false;
+
+		string? upAuth = null;
+		string? unAuth = null;
 
 		foreach (Match match in LinkRegex.Matches(html))
 		{
@@ -755,26 +841,64 @@ internal static class HnHtmlFormHelper
 			if (!href.StartsWith("vote?", StringComparison.OrdinalIgnoreCase))
 				continue;
 
-			var uri = Resolve(
-				new Uri("https://news.ycombinator.com/"),
-				href);
+			Uri uri;
+			try
+			{
+				uri = Resolve(
+					new Uri("https://news.ycombinator.com/"),
+					href);
+			}
+			catch
+			{
+				continue;
+			}
 
 			var query = ParseQuery(uri.Query);
 
-			if (!int.TryParse(query.GetValueOrDefault("id"), out var id) ||
+			if (!int.TryParse(
+				query.GetValueOrDefault("id"),
+				out var id) ||
 				id != itemId)
+			{
 				continue;
+			}
 
 			var token = query.GetValueOrDefault("auth");
 			if (string.IsNullOrWhiteSpace(token))
 				continue;
 
-			auth = token;
-			hasUpvoted = string.Equals(
-				query.GetValueOrDefault("how"),
-				"un",
-				StringComparison.OrdinalIgnoreCase);
+			var how = query.GetValueOrDefault("how");
 
+			if (string.Equals(
+				how,
+				"un",
+				StringComparison.OrdinalIgnoreCase))
+			{
+				unAuth = token;
+			}
+			else if (string.Equals(
+				how,
+				"up",
+				StringComparison.OrdinalIgnoreCase))
+			{
+				upAuth = token;
+			}
+		}
+
+		// HN showing an "unvote" link means the user has already upvoted.
+		if (!string.IsNullOrWhiteSpace(unAuth))
+		{
+			auth = unAuth;
+			hasUpvoted = true;
+			return true;
+		}
+
+		// Otherwise an "upvote" link means voting is available and
+		// the user has not currently upvoted.
+		if (!string.IsNullOrWhiteSpace(upAuth))
+		{
+			auth = upAuth;
+			hasUpvoted = false;
 			return true;
 		}
 

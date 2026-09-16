@@ -66,7 +66,7 @@ namespace HNReader
 		private const string LastFetchKey = "LastFetchUtc";
 		private const string PostsCacheFileName = "posts_cache.json";
 		private const string PostsCacheTempFileName = "posts_cache.tmp.json";
-		private const int PostsCacheVersion = 1; // bump only for incompatible cache changes
+		private const int PostsCacheVersion = 2; // bump only for incompatible cache changes
 		private readonly Dictionary<int, List<CommentCacheItem>> _cachedComments = [];
 		private static readonly TimeSpan CommentCacheFreshness = TimeSpan.FromHours(1);
 		private CancellationTokenSource? _saveOfflineCts;
@@ -123,6 +123,9 @@ namespace HNReader
 			public string? Text { get; set; }
 			public long Time { get; set; }
 			public List<int>? ChildIds { get; set; } // optional, helps reconstruct tree
+			public int? Score { get; set; }
+			public bool CanVote { get; set; }
+			public bool HasUpvoted { get; set; }
 		}
 
 		private sealed class PostCacheItem
@@ -139,6 +142,8 @@ namespace HNReader
 			public List<CommentCacheItem>? Comments { get; set; }
 			public long? CommentsFetchedUnix { get; set; }
 			public List<int>? Kids { get; set; }
+			public bool CanVote { get; set; }
+			public bool HasUpvoted { get; set; }
 		}
 
 		private sealed class PostsCache
@@ -499,6 +504,8 @@ namespace HNReader
 						Time = p.Time,
 						Url = p.Url,
 						Text = p.Text,
+						CanVote = p.CanVote,
+						HasUpvoted = p.HasUpvoted,
 						Descendants = p.Descendants,
 						Comments = commentsForPost,
 						Kids = p.Kids,
@@ -621,6 +628,11 @@ namespace HNReader
 				return post;
 
 			var hydrated = await client.GetItemAsync(post.Id, ct).ConfigureAwait(false);
+			if (hydrated != null && _backend.IsAuthenticated)
+			{
+				await _backend.ApplyVoteInfoAsync(hydrated, ct)
+					.ConfigureAwait(false);
+			}
 			return hydrated ?? post;
 		}
 
@@ -662,7 +674,9 @@ namespace HNReader
 							Url = it.Url,
 							Descendants = it.Descendants,
 							Kids = it.Kids,
-							Text = it.Text
+							Text = it.Text,
+							CanVote = it.CanVote,
+							HasUpvoted = it.HasUpvoted
 						});
 
 						lock (_cacheStateLock)
@@ -865,6 +879,14 @@ namespace HNReader
 					// take next UI-sized slice from the already-fetched IDs
 					var slice = result.Posts.Skip(_postsOffset).Take(PostsBatchSize).ToList();
 					if (slice.Count == 0) break;
+					if (_backend.IsAuthenticated)
+					{
+						foreach (var post in slice)
+						{
+							ct.ThrowIfCancellationRequested();
+							await _backend.ApplyPostVoteInfoAsync(post, ct);
+						}
+					}
 
 					// marshal the append to UI thread
 					await RunOnUiAsync(() =>
@@ -1060,6 +1082,11 @@ namespace HNReader
 				if (string.Equals(info.Type, "story", StringComparison.OrdinalIgnoreCase))
 				{
 					var post = await client.GetItemAsync(id.Value, ct).ConfigureAwait(false);
+					if (post != null && _backend.IsAuthenticated)
+					{
+						await _backend.ApplyVoteInfoAsync(post, ct)
+							.ConfigureAwait(false);
+					}
 					if (post == null)
 					{
 						await RunOnUiAsync(async () =>
@@ -1108,59 +1135,68 @@ namespace HNReader
 
 		private async void RefreshButton_Click(object sender, RoutedEventArgs e)
 		{
-			if (_isRefreshing) return;
+			if (_isRefreshing)
+				return;
 
 			_isRefreshing = true;
 			RefreshButton.IsEnabled = false;
 
 			try
 			{
-				await StartPostsInitialLoadAsync(force: true);
-
 				var current = _currentPost;
 				var currentIsEphemeral = _currentIsEphemeral;
 				var currentFocusCommentId = _currentFocusCommentId;
 
+				// Stop the currently displayed content load before replacing it.
+				SafeCancelDispose(ref _currentCommentsLoadCts);
+
+				// Refresh the post list.
+				await StartPostsInitialLoadAsync(force: true);
+
 				if (current != null)
 				{
-					_currentCommentsLoadCts?.Cancel();
-					_currentCommentsLoadCts?.Dispose();
+					if (currentIsEphemeral)
+					{
+						// Ephemeral posts are not part of _posts, so fetch them explicitly.
+						var refreshed = await client.GetItemAsync(
+							current.Id,
+							CancellationToken.None);
+
+						if (refreshed != null)
+							current = refreshed;
+					}
+					else
+					{
+						// Reuse the freshly fetched instance from the post list.
+						var refreshed = _posts.FirstOrDefault(
+							p => p.Id == current.Id);
+
+						if (refreshed != null)
+							current = refreshed;
+					}
+
+					_currentPost = current;
+
 					_currentCommentsLoadCts = new CancellationTokenSource();
-					var ct = _currentCommentsLoadCts.Token;
 
-					try
-					{
-						if (currentIsEphemeral)
-						{
-							var refreshed = await client.GetItemAsync(current.Id, ct).ConfigureAwait(true);
-							if (refreshed != null)
-							{
-								_currentPost = current = refreshed;
-							}
-						}
-						else
-						{
-							var refreshed = _posts.FirstOrDefault(p => p.Id == current.Id);
-							if (refreshed != null)
-								_currentPost = current = refreshed;
-						}
-
-						await LoadPostContentAsync(
-							current,
-							currentIsEphemeral,
-							currentFocusCommentId,
-							ct,
-							forceNetwork: true);
-					}
-					catch (OperationCanceledException) { }
-					catch (Exception ex)
-					{
-						System.Diagnostics.Debug.WriteLine($"Refresh content failed for post {current.Id}: {ex}");
-					}
+					await LoadPostContentAsync(
+						current,
+						currentIsEphemeral,
+						currentFocusCommentId,
+						_currentCommentsLoadCts.Token,
+						forceNetwork: true);
 				}
 
 				if (PostsList.Items?.Count > 0)
 					PostsList.ScrollIntoView(PostsList.Items[0]);
+			}
+			catch (OperationCanceledException)
+			{
+				// A superseded content operation was cancelled intentionally.
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"RefreshButton_Click error: {ex}");
 			}
 			finally
 			{
@@ -1351,6 +1387,14 @@ namespace HNReader
 					try
 					{
 						var slice = result.Posts!.Skip(_postsOffset).Take(PostsBatchSize).ToList();
+						if (_backend.IsAuthenticated)
+						{
+							foreach (var post in slice)
+							{
+								ct.ThrowIfCancellationRequested();
+								await _backend.ApplyPostVoteInfoAsync(post, ct);
+							}
+						}
 						System.Diagnostics.Debug.WriteLine($"DEBUG: slice.Count={slice.Count} _postsOffset={_postsOffset}");
 						// append directly (we're on UI thread via StartPostsInitialLoadAsync)
 						_posts.AddRange(slice);
@@ -1794,6 +1838,8 @@ namespace HNReader
 					By = comment.By,
 					Text = comment.Text,
 					Time = comment.Time,
+					CanVote = comment.CanVote,
+					HasUpvoted = comment.HasUpvoted,
 					ChildIds = comment.Children?.Select(c => c.Id).ToList()
 				});
 
@@ -1830,7 +1876,9 @@ namespace HNReader
 					By = ci.By,
 					Text = ci.Text ?? string.Empty,
 					Time = ci.Time,
-					Children = []
+					Children = [],
+					CanVote = ci.CanVote,
+					HasUpvoted = ci.HasUpvoted
 				};
 				map[ci.Id] = c;
 			}
@@ -2377,6 +2425,8 @@ namespace HNReader
 								By = c.By,
 								Text = c.Text,
 								Time = c.Time,
+								CanVote = c.CanVote,
+								HasUpvoted = c.HasUpvoted,
 								ChildIds = childIds
 							});
 
@@ -2551,8 +2601,7 @@ namespace HNReader
 				comment.Id,
 				HnTargetKind.Comment,
 				comment.HasUpvoted,
-				hasUpvoted => comment.HasUpvoted = hasUpvoted,
-				scoreDelta => comment.Score = (comment.Score ?? 0) + scoreDelta);
+				hasUpvoted => comment.HasUpvoted = hasUpvoted);
 		}
 
 		private async void PostUpvote_Click(object sender, RoutedEventArgs e)
@@ -2569,8 +2618,8 @@ namespace HNReader
 				postId,
 				HnTargetKind.Story,
 				post.HasUpvoted,
-				hasUpvoted => post.HasUpvoted = hasUpvoted,
-				scoreDelta => post.Score += scoreDelta);
+				hasUpvoted => post.HasUpvoted = hasUpvoted);
+
 
 			// Only the post's Score/HasUpvoted persist in the on-disk cache today (comment
 			// vote state does not - CommentCacheItem has no Score/HasUpvoted fields), so
@@ -2587,15 +2636,13 @@ namespace HNReader
 		/// plus a lightweight glyph color change on the clicked button itself.
 		/// </summary>
 		/// <param name="applyHasUpvoted">Setter for the model's HasUpvoted property.</param>
-		/// <param name="applyScoreDelta">Adds +1/-1 to the model's Score on success.</param>
 		/// <returns>true if the vote was confirmed by the backend.</returns>
 		private async Task<bool> HandleVoteClickAsync(
 			Control voteButton,
 			int itemId,
 			HnTargetKind targetKind,
 			bool currentlyUpvoted,
-			Action<bool> applyHasUpvoted,
-			Action<int> applyScoreDelta)
+			Action<bool> applyHasUpvoted)
 		{
 			if (!_backend.IsAuthenticated)
 			{
@@ -2620,7 +2667,6 @@ namespace HNReader
 
 				var confirmedUpvoted = result.HasUpvoted ?? up;
 				applyHasUpvoted(confirmedUpvoted);
-				applyScoreDelta(confirmedUpvoted ? 1 : -1);
 				SetVoteButtonVisualState(voteButton, confirmedUpvoted);
 				return true;
 			}
