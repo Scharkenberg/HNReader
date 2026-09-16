@@ -163,8 +163,18 @@ public sealed class HnBackendClient : IAsyncDisposable
 	public IAsyncEnumerable<Comment> StreamCommentsAsync(Post post, CancellationToken ct = default)
 		=> _reader.GetCommentsStreamAsync(post, ct);
 
-	public Task<HNResult> GetTopStoriesAsync(int limit = 50, CancellationToken ct = default)
+	public Task<HNResult> GetTopStoriesAsync(int limit = 30, CancellationToken ct = default)
 		=> _reader.GetTopStoriesAsync(limit, ct);
+
+	public async Task<Dictionary<int, VoteInfo>> GetCurrentPostVoteInfoAsync(CancellationToken ct = default)
+	{
+		if (!IsAuthenticated)
+			return [];
+
+		var html = await _web.GetStringAsync("news", ct).ConfigureAwait(false);
+
+		return _web.GetVoteInfo(html);
+	}
 
 	public async Task ApplyVoteInfoAsync(
 	Post post,
@@ -181,7 +191,7 @@ public sealed class HnBackendClient : IAsyncDisposable
 			$"item?id={post.Id}",
 			ct).ConfigureAwait(false);
 
-		if (_web.TryGetVoteInfo(
+		if (HnWebSessionClient.TryGetVoteInfo(
 			html,
 			post.Id,
 			out var auth,
@@ -214,7 +224,7 @@ public sealed class HnBackendClient : IAsyncDisposable
 			$"item?id={post.Id}",
 			ct).ConfigureAwait(false);
 
-		if (_web.TryGetVoteInfo(
+		if (HnWebSessionClient.TryGetVoteInfo(
 			html,
 			post.Id,
 			out _,
@@ -428,7 +438,7 @@ public sealed class HnWriteService
 			// upvote-only accounts (the common case) only one arrow ever exists, so this
 			// doesn't come up. Extend TryGetVoteInfo to disambiguate by `how=` if you add
 			// downvoting.
-			if (!_web.TryGetVoteInfo(html, itemId, out var auth, out _))
+			if (!HnWebSessionClient.TryGetVoteInfo(html, itemId, out var auth, out _))
 			{
 				return new HnActionResult(
 					false,
@@ -459,7 +469,7 @@ public sealed class HnWriteService
 				.ConfigureAwait(false);
 
 			var confirmed =
-				_web.TryGetVoteInfo(
+				HnWebSessionClient.TryGetVoteInfo(
 					verificationHtml,
 					itemId,
 					out _,
@@ -666,7 +676,7 @@ internal sealed partial class HnWebSessionClient : IDisposable
 		return new Uri(BaseUri, relativeOrAbsolute);
 	}
 
-	public bool TryGetVoteInfo(
+	public static bool TryGetVoteInfo(
 	string html,
 	int itemId,
 	out string auth,
@@ -677,6 +687,11 @@ internal sealed partial class HnWebSessionClient : IDisposable
 			itemId,
 			out auth,
 			out hasUpvoted);
+	}
+
+	public Dictionary<int, VoteInfo> GetVoteInfo(string html)
+	{
+		return HnHtmlFormHelper.GetVoteInfo(html);
 	}
 
 	public void Dispose()
@@ -696,6 +711,10 @@ internal sealed class HnHtmlForm(Uri actionUri, string method, Dictionary<string
 
 	public void SetField(string name, string value) => Fields[name] = value;
 }
+
+public readonly record struct VoteInfo(
+	string Auth,
+	bool HasUpvoted);
 
 internal static class HnHtmlFormHelper
 {
@@ -819,20 +838,12 @@ internal static class HnHtmlFormHelper
 
 		return result;
 	}
-	internal static bool TryGetVoteInfo(
-		string html,
-		int itemId,
-		out string auth,
-		out bool hasUpvoted)
+	internal static Dictionary<int, VoteInfo> GetVoteInfo(string html)
 	{
-		auth = string.Empty;
-		hasUpvoted = false;
+		var result = new Dictionary<int, VoteInfo>();
 
 		if (string.IsNullOrWhiteSpace(html))
-			return false;
-
-		string? upAuth = null;
-		string? unAuth = null;
+			return result;
 
 		foreach (Match match in LinkRegex.Matches(html))
 		{
@@ -842,6 +853,7 @@ internal static class HnHtmlFormHelper
 				continue;
 
 			Uri uri;
+
 			try
 			{
 				uri = Resolve(
@@ -857,54 +869,51 @@ internal static class HnHtmlFormHelper
 
 			if (!int.TryParse(
 				query.GetValueOrDefault("id"),
-				out var id) ||
-				id != itemId)
+				out var itemId))
 			{
 				continue;
 			}
 
-			var token = query.GetValueOrDefault("auth");
-			if (string.IsNullOrWhiteSpace(token))
+			var auth = query.GetValueOrDefault("auth");
+			if (string.IsNullOrWhiteSpace(auth))
 				continue;
 
 			var how = query.GetValueOrDefault("how");
 
-			if (string.Equals(
+			var hasUpvoted = string.Equals(
 				how,
 				"un",
-				StringComparison.OrdinalIgnoreCase))
+				StringComparison.OrdinalIgnoreCase);
+
+			// Prefer "un" if HN exposes both links for the same item.
+			if (!result.TryGetValue(itemId, out var existing) ||
+				(hasUpvoted && !existing.HasUpvoted))
 			{
-				unAuth = token;
-			}
-			else if (string.Equals(
-				how,
-				"up",
-				StringComparison.OrdinalIgnoreCase))
-			{
-				upAuth = token;
+				result[itemId] = new VoteInfo(auth, hasUpvoted);
 			}
 		}
 
-		// HN showing an "unvote" link means the user has already upvoted.
-		if (!string.IsNullOrWhiteSpace(unAuth))
-		{
-			auth = unAuth;
-			hasUpvoted = true;
-			return true;
-		}
-
-		// Otherwise an "upvote" link means voting is available and
-		// the user has not currently upvoted.
-		if (!string.IsNullOrWhiteSpace(upAuth))
-		{
-			auth = upAuth;
-			hasUpvoted = false;
-			return true;
-		}
-
-		return false;
+		return result;
 	}
 
+	internal static bool TryGetVoteInfo(
+		string html,
+		int itemId,
+		out string auth,
+		out bool hasUpvoted)
+	{
+		auth = string.Empty;
+		hasUpvoted = false;
+
+		var all = GetVoteInfo(html);
+
+		if (!all.TryGetValue(itemId, out var info))
+			return false;
+
+		auth = info.Auth;
+		hasUpvoted = info.HasUpvoted;
+		return true;
+	}
 }
 
 internal static class HnStringHelpers

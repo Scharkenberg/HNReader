@@ -636,6 +636,49 @@ namespace HNReader
 			return hydrated ?? post;
 		}
 
+		private async Task RefreshPostVoteStatesAsync(CancellationToken ct)
+		{
+			if (!_backend.IsAuthenticated || _posts.Count == 0)
+				return;
+
+			Dictionary<int, VoteInfo> voteInfo;
+
+			try
+			{
+				voteInfo = await _backend
+					.GetCurrentPostVoteInfoAsync(ct)
+					.ConfigureAwait(false);
+			}
+			catch (OperationCanceledException)
+			{
+				throw;
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"RefreshPostVoteStatesAsync failed: {ex}");
+				return;
+			}
+
+			await RunOnUiAsync(() =>
+			{
+				foreach (var post in _posts)
+				{
+					if (voteInfo.TryGetValue(post.Id, out var info))
+					{
+						post.CanVote = true;
+						post.HasUpvoted = info.HasUpvoted;
+					}
+					else
+					{
+						post.CanVote = false;
+						post.HasUpvoted = false;
+					}
+				}
+			});
+
+			MarkPostsCacheDirty();
+		}
+
 		private async Task<bool> LoadPostsCacheAsync()
 		{
 			try
@@ -815,6 +858,7 @@ namespace HNReader
 
 					break;
 				}
+				if (!ct.IsCancellationRequested && _backend.IsAuthenticated) await RefreshPostVoteStatesAsync(ct);
 			}
 			catch (OperationCanceledException) { }
 			catch (Exception ex)
@@ -913,7 +957,8 @@ namespace HNReader
 
 					break;
 				}
-
+				if (!ct.IsCancellationRequested && _backend.IsAuthenticated)
+					await RefreshPostVoteStatesAsync(ct);
 				return true;
 			}
 			catch (OperationCanceledException)
@@ -967,6 +1012,7 @@ namespace HNReader
 					if (loaded)
 					{
 						System.Diagnostics.Debug.WriteLine($"Loaded {_posts.Count} posts from cache (recent).");
+						if (_backend.IsAuthenticated) await RefreshPostVoteStatesAsync(_postsLoadCts!.Token);
 						return;
 					}
 				}
