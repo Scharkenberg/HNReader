@@ -95,7 +95,7 @@
 											FontFamily="{StaticResource InterTight}"
 											FontSize="14"
 											Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
-											Text="{x:Bind ScoreText}" />
+											Text="{x:Bind ScoreText, Mode=OneWay}" />
 									</StackPanel>
 									<TextBlock
 										VerticalAlignment="Center"

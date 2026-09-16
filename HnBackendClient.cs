@@ -109,7 +109,8 @@ public sealed record HnActionResult(
 	HttpStatusCode? StatusCode,
 	string? Message,
 	string? ResponseHtml,
-	Uri? ActionUri = null);
+	Uri? ActionUri = null,
+	bool? HasUpvoted = null);
 
 public enum HnTargetKind
 {
@@ -333,22 +334,66 @@ public sealed class HnWriteService
 		_throttleDelay = throttleDelay;
 	}
 
-	public async Task<HnActionResult> VoteAsync(int itemId, HnTargetKind targetKind, CancellationToken ct = default)
+	/// <summary>
+	/// Casts (or retracts) an upvote on a story or comment.
+	/// </summary>
+	/// <param name="up">
+	/// true to upvote the item; false to retract an existing upvote ("un-vote").
+	/// Downvoting is not supported here: HN only shows a down arrow to accounts with
+	/// enough karma, and doing it safely needs its own explicit path, not an overload
+	/// of this one.
+	/// </param>
+	public async Task<HnActionResult> VoteAsync(
+		int itemId,
+		HnTargetKind targetKind,
+		bool up,
+		CancellationToken ct = default)
 	{
 		await _gate.WaitAsync(ct).ConfigureAwait(false);
 		try
 		{
 			var html = await _web.GetStringAsync($"item?id={itemId}", ct).ConfigureAwait(false);
 
-			// The upvote control is rendered as a link; we follow the first matching vote URL we can find.
-			var voteUri = HnHtmlFormHelper.FindFirstLink(html, _web.BaseUri, $"vote?id={itemId}");
-			if (voteUri is null)
-				return new HnActionResult(false, null, "Vote link not found.", html);
+			// Vote links carry a per-item, per-user auth token; without it HN's vote
+			// endpoint rejects the request outright, so a URL built from the id alone
+			// is never enough. TryGetVoteInfo reads that token straight off the vote
+			// arrow HN itself rendered for this item.
+			//
+			// Known limitation: if an account has enough karma to see both an up and a
+			// down arrow on the same item, TryGetVoteInfo returns whichever of the two
+			// it encounters first in the markup, not necessarily the "up" one. For
+			// upvote-only accounts (the common case) only one arrow ever exists, so this
+			// doesn't come up. Extend TryGetVoteInfo to disambiguate by `how=` if you add
+			// downvoting.
+			if (!_web.TryGetVoteInfo(html, itemId, out var auth, out _))
+			{
+				return new HnActionResult(
+					false,
+					null,
+					"Vote control not found for this item (not signed in, self-authored, voting closed, or the item id is wrong).",
+					html);
+			}
+
+			var how = up ? "up" : "un";
+			var voteUri = new Uri(_web.BaseUri, $"vote?id={itemId}&how={how}&auth={Uri.EscapeDataString(auth)}");
 
 			var response = await _web.GetStringAsync(voteUri.AbsoluteUri, ct).ConfigureAwait(false);
 			await Task.Delay(_throttleDelay, ct).ConfigureAwait(false);
 
-			return new HnActionResult(true, HttpStatusCode.OK, "Vote submitted.", response, voteUri);
+			// The vote endpoint redirects back to a page that reflects the new state.
+			// Re-read that state instead of assuming a 2xx response means the vote took;
+			// HN silently no-ops instead of erroring on things like voting on your own post.
+			var confirmed =
+				_web.TryGetVoteInfo(response, itemId, out _, out var nowUpvoted) &&
+				nowUpvoted == up;
+
+			return new HnActionResult(
+				confirmed,
+				HttpStatusCode.OK,
+				confirmed ? "Vote submitted." : "Vote request sent, but the resulting page didn't confirm the new state.",
+				response,
+				voteUri,
+				HasUpvoted: confirmed ? up : (bool?)null);
 		}
 		finally
 		{
@@ -540,21 +585,6 @@ internal sealed partial class HnWebSessionClient : IDisposable
 			return absolute;
 
 		return new Uri(BaseUri, relativeOrAbsolute);
-	}
-
-	public async Task<bool> VoteAsync(
-	int itemId,
-	bool up,
-	CancellationToken ct = default)
-	{
-		var uri = new Uri(
-			BaseUri,
-			$"vote?id={itemId}&how={(up ? "up" : "un")}");
-
-		using var response = await _http.GetAsync(uri, ct)
-			.ConfigureAwait(false);
-
-		return response.IsSuccessStatusCode;
 	}
 
 	public bool TryGetVoteInfo(

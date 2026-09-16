@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
@@ -162,7 +164,7 @@ namespace HNReader
 			return (await GetCommentsTreeResultAsync(post, ct).ConfigureAwait(false)).Comments;
 		}
 
-		private static List<Comment> BuildCommentRoots(Dictionary<int, CommentRaw> rawById,	int[] rootIds)
+		private static List<Comment> BuildCommentRoots(Dictionary<int, CommentRaw> rawById, int[] rootIds)
 		{
 			var built = new Dictionary<int, List<Comment>>();
 			var building = new HashSet<int>();
@@ -230,7 +232,7 @@ namespace HNReader
 		{
 			try
 			{
-				return await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, GetJsonTypeInfo<CommentRaw>(),ct)
+				return await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, GetJsonTypeInfo<CommentRaw>(), ct)
 					.ConfigureAwait(false);
 			}
 			catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -331,7 +333,7 @@ namespace HNReader
 		}
 
 		public async Task<(string? Type, int Id, int? Parent)> GetItemInfoAsync(
-			int id,							   
+			int id,
 			CancellationToken ct = default)
 		{
 			ct.ThrowIfCancellationRequested();
@@ -595,11 +597,53 @@ namespace HNReader
 		}
 	}
 
-	public class Comment
+	/// <summary>
+	/// Shared change-notification base for Post/Comment. Both are bound directly to XAML
+	/// (ListView via x:Bind, TreeView via classic {Binding}); without this, updating a
+	/// property in code-behind — e.g. after a vote completes — has no effect on-screen
+	/// until the item is scrolled out of and back into view.
+	/// </summary>
+	public abstract class ObservableModel : INotifyPropertyChanged
+	{
+		public event PropertyChangedEventHandler? PropertyChanged;
+
+		protected void RaisePropertyChanged([CallerMemberName] string? propertyName = null) =>
+			PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+		/// <summary>
+		/// Sets a backing field and raises PropertyChanged only when the value actually
+		/// changed. Returns true when it changed, so callers can cascade notifications to
+		/// dependent computed properties (e.g. Score -> ScoreText).
+		/// </summary>
+		protected bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+		{
+			if (EqualityComparer<T>.Default.Equals(field, value))
+				return false;
+
+			field = value;
+			RaisePropertyChanged(propertyName);
+			return true;
+		}
+	}
+
+	public class Comment : ObservableModel
 	{
 		public int Id { get; set; }
-		public bool CanVote { get; set; }
-		public bool HasUpvoted { get; set; }
+
+		private bool _canVote;
+		public bool CanVote
+		{
+			get => _canVote;
+			set => SetField(ref _canVote, value);
+		}
+
+		private bool _hasUpvoted;
+		public bool HasUpvoted
+		{
+			get => _hasUpvoted;
+			set => SetField(ref _hasUpvoted, value);
+		}
+
 		public bool Deleted { get; set; } = false;
 		public bool Dead { get; set; } = false;
 		public string? By { get; set; }
@@ -607,7 +651,18 @@ namespace HNReader
 		public long Time { get; set; }
 		public List<Comment> Children { get; set; } = [];
 		public int Descendants { get; set; } = 0;
-		public int? Score { get; set; }
+
+		private int? _score;
+		public int? Score
+		{
+			get => _score;
+			set
+			{
+				if (SetField(ref _score, value))
+					RaisePropertyChanged(nameof(ScoreAndTime));
+			}
+		}
+
 		public bool IsExpanded { get; set; } = true;
 		public string TimeAgo
 		{
@@ -655,14 +710,38 @@ namespace HNReader
 			{ Success = false, IsNetworkError = true, ErrorMessage = message };
 	}
 
-	public class Post
+	public class Post : ObservableModel
 	{
 		public int Id { get; set; }
-		public bool CanVote { get; set; }
-		public bool HasUpvoted { get; set; }
+
+		private bool _canVote;
+		public bool CanVote
+		{
+			get => _canVote;
+			set => SetField(ref _canVote, value);
+		}
+
+		private bool _hasUpvoted;
+		public bool HasUpvoted
+		{
+			get => _hasUpvoted;
+			set => SetField(ref _hasUpvoted, value);
+		}
+
 		public string? Title { get; set; }
 		public string? By { get; set; }
-		public int Score { get; set; }
+
+		private int _score;
+		public int Score
+		{
+			get => _score;
+			set
+			{
+				if (SetField(ref _score, value))
+					RaisePropertyChanged(nameof(ScoreText));
+			}
+		}
+
 		public long Time { get; set; }
 		public string? Url { get; set; }
 		public List<int>? Kids { get; set; }

@@ -2535,14 +2535,116 @@ namespace HNReader
 			catch { }
 		}
 
-		private void CommentUpvote_Click(object sender, RoutedEventArgs e)
+		private async void CommentUpvote_Click(object sender, RoutedEventArgs e)
 		{
+			if (sender is not Control fe)
+				return;
 
+			// The comments TreeView uses classic {Binding}, so each generated container's
+			// DataContext is the TreeViewNode wrapping the Comment (the existing
+			// {Binding Content.By} etc. in the DataTemplate already rely on this).
+			if (fe.DataContext is not TreeViewNode node || node.Content is not Comment comment)
+				return;
+
+			await HandleVoteClickAsync(
+				fe,
+				comment.Id,
+				HnTargetKind.Comment,
+				comment.HasUpvoted,
+				hasUpvoted => comment.HasUpvoted = hasUpvoted,
+				scoreDelta => comment.Score = (comment.Score ?? 0) + scoreDelta);
 		}
 
-		private void PostUpvote_Click(object sender, RoutedEventArgs e)
+		private async void PostUpvote_Click(object sender, RoutedEventArgs e)
 		{
+			if (sender is not Control fe || fe.Tag is not int postId)
+				return;
 
+			var post = _posts.FirstOrDefault(p => p.Id == postId);
+			if (post == null)
+				return;
+
+			var succeeded = await HandleVoteClickAsync(
+				fe,
+				postId,
+				HnTargetKind.Story,
+				post.HasUpvoted,
+				hasUpvoted => post.HasUpvoted = hasUpvoted,
+				scoreDelta => post.Score += scoreDelta);
+
+			// Only the post's Score/HasUpvoted persist in the on-disk cache today (comment
+			// vote state does not - CommentCacheItem has no Score/HasUpvoted fields), so
+			// there's nothing worth flushing for a comment vote.
+			if (succeeded)
+				MarkPostsCacheDirty();
+		}
+
+		/// <summary>
+		/// Shared vote flow for both the post list and the comment tree: requires sign-in,
+		/// guards against double-clicks while a request is in flight, calls the backend,
+		/// and on success applies the new state to the bound model (which now implements
+		/// INotifyPropertyChanged, so ListView/TreeView pick the change up automatically)
+		/// plus a lightweight glyph color change on the clicked button itself.
+		/// </summary>
+		/// <param name="applyHasUpvoted">Setter for the model's HasUpvoted property.</param>
+		/// <param name="applyScoreDelta">Adds +1/-1 to the model's Score on success.</param>
+		/// <returns>true if the vote was confirmed by the backend.</returns>
+		private async Task<bool> HandleVoteClickAsync(
+			Control voteButton,
+			int itemId,
+			HnTargetKind targetKind,
+			bool currentlyUpvoted,
+			Action<bool> applyHasUpvoted,
+			Action<int> applyScoreDelta)
+		{
+			if (!_backend.IsAuthenticated)
+			{
+				await ShowLoginDialogAsync();
+				return false;
+			}
+
+			if (!voteButton.IsEnabled)
+				return false; // a request for this item is already in flight
+
+			voteButton.IsEnabled = false;
+			try
+			{
+				var up = !currentlyUpvoted;
+				var result = await _backend.Write.VoteAsync(itemId, targetKind, up);
+
+				if (!result.Success)
+				{
+					await ShowErrorDialog(result.Message ?? "Vote failed.");
+					return false;
+				}
+
+				var confirmedUpvoted = result.HasUpvoted ?? up;
+				applyHasUpvoted(confirmedUpvoted);
+				applyScoreDelta(confirmedUpvoted ? 1 : -1);
+				SetVoteButtonVisualState(voteButton, confirmedUpvoted);
+				return true;
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"Vote failed for item {itemId}: {ex}");
+				await ShowErrorDialog("Vote failed due to a network or unexpected error.");
+				return false;
+			}
+			finally
+			{
+				voteButton.IsEnabled = true;
+			}
+		}
+
+		private static void SetVoteButtonVisualState(FrameworkElement voteButton, bool hasUpvoted)
+		{
+			if (voteButton is not Button { Content: FontIcon icon })
+				return;
+
+			if (hasUpvoted)
+				icon.Foreground = new SolidColorBrush(Microsoft.UI.Colors.OrangeRed);
+			else
+				icon.ClearValue(FontIcon.ForegroundProperty);
 		}
 	}
 }
