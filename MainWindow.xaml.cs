@@ -1,12 +1,9 @@
-using Microsoft.UI.Windowing;
-using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Controls.Primitives;
-using Microsoft.UI.Xaml.Documents;
-using Microsoft.UI.Xaml.Media;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -14,9 +11,16 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Documents;
+using Microsoft.UI.Xaml.Media;
 using Windows.Graphics.Display;
 using Windows.System;
 
@@ -32,9 +36,9 @@ namespace HNReader
 		private bool _isClosing = false;
 
 		// Posts incremental state
-		private ObservableCollection<Post> _posts = [];
+		private BulkObservableCollection<Post> _posts = new();
 		private CancellationTokenSource? _postsLoadCts;
-		private readonly SemaphoreSlim _postsLoadLock = new SemaphoreSlim(1, 1);
+		private readonly SemaphoreSlim _postsLoadLock = new(1, 1);
 		private bool _postsHasMore = true;
 		private int _postsOffset = 0;
 		private const int PostsBatchSize = 5;
@@ -66,6 +70,51 @@ namespace HNReader
 		private readonly Dictionary<int, List<CommentCacheItem>> _cachedComments = [];
 		private static readonly TimeSpan CommentCacheFreshness = TimeSpan.FromHours(1);
 		private CancellationTokenSource? _saveOfflineCts;
+
+		[GeneratedRegex(@"(?:\?|&)id=(\d+)(?:&|$)", RegexOptions.IgnoreCase)]
+		private static partial Regex HnItemIdQueryRegex();
+
+		[GeneratedRegex(@"^item\?(?:.*&)?id=(\d+)(?:&.*)?$", RegexOptions.IgnoreCase)]
+		private static partial Regex HnItemIdRelativeRegex();
+
+		private readonly HnBackendClient _backend;
+
+		private sealed class BulkObservableCollection<T> : ObservableCollection<T>
+		{
+			private bool _suppressNotifications;
+
+			public void AddRange(IEnumerable<T> items)
+			{
+				if (items == null)
+					return;
+
+				var list = items as IList<T> ?? [.. items];
+				if (list.Count == 0)
+					return;
+
+				try
+				{
+					_suppressNotifications = true;
+					foreach (var item in list)
+						Items.Add(item);
+				}
+				finally
+				{
+					_suppressNotifications = false;
+				}
+
+				OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+				OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+				OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+			}
+
+			protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
+			{
+				if (!_suppressNotifications)
+					base.OnCollectionChanged(e);
+			}
+		}
+
 		private sealed class CommentCacheItem
 		{
 			public int Id { get; set; }
@@ -123,10 +172,7 @@ namespace HNReader
 			_appWindow = AppWindow.GetFromWindowId(windowId);
 
 			ApplySavedFontAndIndent();
-#pragma warning disable CS4014
 			_ = CleanupLeftoverTempFilesAsync();
-#pragma warning restore CS4014
-
 			var titleBar = _appWindow.TitleBar;
 			titleBar.ButtonBackgroundColor = null;
 			titleBar.ButtonForegroundColor = null;
@@ -159,6 +205,10 @@ namespace HNReader
 
 			LeftPane.MinWidth = 360;
 			LeftPane.MaxWidth = 480;
+
+			_backend = new HnBackendClient(client, new HnBackendOptions(), new JsonFileHnSessionStore(Path.Combine(Windows.Storage.ApplicationData.Current.LocalFolder.Path, "hn_session.json")));
+
+			_ = InitializeBackendAsync();
 		}
 
 		private void MainWindow_Activated(object? sender, Microsoft.UI.Xaml.WindowActivatedEventArgs e)
@@ -171,7 +221,7 @@ namespace HNReader
 				{
 					_displayInfo = Windows.Graphics.Display.DisplayInformation.GetForCurrentView();
 					_cachedScale = _displayInfo?.RawPixelsPerViewPixel ?? 1.0;
-					if (_displayInfo != null) _displayInfo.DpiChanged += DisplayInfo_DpiChanged;
+					_displayInfo?.DpiChanged += DisplayInfo_DpiChanged;
 
 					var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
 					var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
@@ -295,7 +345,6 @@ namespace HNReader
 		{
 			try
 			{
-				OpenInBrowserIcon.IsEnabled = enabled;
 				IncreaseFontSizeIcon.IsEnabled = enabled;
 				DecreaseFontSizeIcon.IsEnabled = enabled;
 				ResetFontSizeIcon.IsEnabled = enabled;
@@ -336,13 +385,13 @@ namespace HNReader
 				var cur = q.Dequeue();
 				if (cur is T t) return t;
 
-				int c = 0;
+				int c;
 				try { c = VisualTreeHelper.GetChildrenCount(cur); }
 				catch { continue; }
 
 				for (int i = 0; i < c; i++)
 				{
-					DependencyObject? child = null;
+					DependencyObject? child;
 					try { child = VisualTreeHelper.GetChild(cur, i); }
 					catch { continue; }
 					if (child != null) q.Enqueue(child);
@@ -382,7 +431,7 @@ namespace HNReader
 			catch { /* ignore */ }
 		}
 
-		private DateTimeOffset LoadLastFetchTime()
+		private static DateTimeOffset LoadLastFetchTime()
 		{
 			try
 			{
@@ -393,12 +442,17 @@ namespace HNReader
 			catch { return DateTimeOffset.MinValue; }
 		}
 
-		private static readonly JsonSerializerOptions _cacheJsonOptions = new JsonSerializerOptions
-		{
+		[JsonSourceGenerationOptions(
 			DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-			PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-			WriteIndented = false
-		};
+			PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+			WriteIndented = false,
+			PropertyNameCaseInsensitive = true)]
+		[JsonSerializable(typeof(PostsCache))]
+		[JsonSerializable(typeof(PostCacheItem))]
+		[JsonSerializable(typeof(CommentCacheItem))]
+		private partial class PostsCacheJsonContext : JsonSerializerContext
+		{
+		}
 
 		private static async Task CleanupLeftoverTempFilesAsync()
 		{
@@ -480,13 +534,11 @@ namespace HNReader
 						uniqueTempName,
 						Windows.Storage.CreationCollisionOption.ReplaceExisting).AsTask().ConfigureAwait(false);
 
-					using (var outStream = await tempFile.OpenStreamForWriteAsync().ConfigureAwait(false))
-					{
-						using var brotli = new BrotliStream(outStream, CompressionLevel.Optimal, leaveOpen: true);
-						await JsonSerializer.SerializeAsync(brotli, cache, _cacheJsonOptions).ConfigureAwait(false);
-						await brotli.FlushAsync().ConfigureAwait(false);
-						await outStream.FlushAsync().ConfigureAwait(false);
-					}
+					using var outStream = await tempFile.OpenStreamForWriteAsync().ConfigureAwait(false);
+					using var brotli = new BrotliStream(outStream, CompressionLevel.Optimal, leaveOpen: true);
+					await JsonSerializer.SerializeAsync(brotli, cache, PostsCacheJsonContext.Default.PostsCache).ConfigureAwait(false);
+					await brotli.FlushAsync().ConfigureAwait(false);
+					await outStream.FlushAsync().ConfigureAwait(false);
 				}
 				catch (Exception writeEx)
 				{
@@ -582,7 +634,7 @@ namespace HNReader
 
 				using var inStream = await file.OpenStreamForReadAsync();
 				using var brotli = new BrotliStream(inStream, CompressionMode.Decompress, leaveOpen: true);
-				var cache = await JsonSerializer.DeserializeAsync<PostsCache>(brotli, _cacheJsonOptions).ConfigureAwait(false);
+				var cache = await JsonSerializer.DeserializeAsync<PostsCache>(brotli, PostsCacheJsonContext.Default.PostsCache).ConfigureAwait(false);
 				if (cache == null || cache.Items == null || cache.Items.Count == 0) return false;
 				if (cache.Version != PostsCacheVersion) return false;
 
@@ -596,9 +648,11 @@ namespace HNReader
 				{
 					_posts.Clear();
 
+					var restoredPosts = new List<Post>(cache.Items.Count);
+
 					foreach (var it in cache.Items)
 					{
-						_posts.Add(new Post
+						restoredPosts.Add(new Post
 						{
 							Id = it.Id,
 							Title = it.Title,
@@ -622,6 +676,7 @@ namespace HNReader
 						}
 					}
 
+					_posts.AddRange(restoredPosts);
 					ApplySavedFontAndIndent();
 				});
 
@@ -725,9 +780,7 @@ namespace HNReader
 
 					await RunOnUiAsync(() =>
 					{
-						foreach (var p in slice)
-							_posts.Add(p);
-
+						_posts.AddRange(slice);
 						ApplySavedFontAndIndent();
 					});
 
@@ -945,10 +998,7 @@ namespace HNReader
 					return null;
 				}
 
-				var match = Regex.Match(
-					absolute.Query,
-					@"(?:\?|&)id=(\d+)(?:&|$)",
-					RegexOptions.IgnoreCase);
+				var match = HnItemIdQueryRegex().Match(absolute.Query);
 
 				if (match.Success &&
 					int.TryParse(match.Groups[1].Value, out var absoluteId))
@@ -962,7 +1012,7 @@ namespace HNReader
 			// Relative HN URL:
 			// item?id=12345
 			// /item?id=12345
-			if (value.StartsWith("/", StringComparison.Ordinal))
+			if (value.StartsWith('/'))
 				value = value[1..];
 
 			if (!value.StartsWith(
@@ -972,10 +1022,7 @@ namespace HNReader
 				return null;
 			}
 
-			var relativeMatch = Regex.Match(
-				value,
-				@"^item\?(?:.*&)?id=(\d+)(?:&.*)?$",
-				RegexOptions.IgnoreCase);
+			var relativeMatch = HnItemIdRelativeRegex().Match(value);
 
 			if (relativeMatch.Success &&
 				int.TryParse(relativeMatch.Groups[1].Value, out var relativeId))
@@ -1233,8 +1280,7 @@ namespace HNReader
 
 			_postsScrollViewer = PostsList.FindDescendant<ScrollViewer>();
 
-			if (_postsScrollViewer != null)
-				_postsScrollViewer.ViewChanged += PostsScrollViewer_ViewChanged;
+			_postsScrollViewer?.ViewChanged += PostsScrollViewer_ViewChanged;
 
 			PostsList.ItemsSource = _posts;
 		}
@@ -1307,7 +1353,7 @@ namespace HNReader
 						var slice = result.Posts!.Skip(_postsOffset).Take(PostsBatchSize).ToList();
 						System.Diagnostics.Debug.WriteLine($"DEBUG: slice.Count={slice.Count} _postsOffset={_postsOffset}");
 						// append directly (we're on UI thread via StartPostsInitialLoadAsync)
-						foreach (var p in slice) _posts.Add(p);
+						_posts.AddRange(slice);
 
 						ApplySavedFontAndIndent();
 
@@ -1446,6 +1492,9 @@ namespace HNReader
 
 			await RunOnUiAsync(() =>
 			{
+				OpenInBrowserIcon.Tag = post.Url ?? $"https://news.ycombinator.com/item?id={post.Id}";
+				OpenInBrowserIcon.IsEnabled = !string.IsNullOrWhiteSpace(OpenInBrowserIcon.Tag.ToString());
+
 				PostTitleText.Text = string.IsNullOrWhiteSpace(post.Title)
 					? $"Item {post.Id}"
 					: post.Title;
@@ -1513,7 +1562,7 @@ namespace HNReader
 			if (string.IsNullOrEmpty(text)) return string.Empty;
 			var s = System.Net.WebUtility.HtmlDecode(text).Replace("\n", " ").Trim();
 			if (s.Length <= max) return s;
-			return s.Substring(0, max - 1) + "…";
+			return string.Concat(s.AsSpan(0, max - 1), "…");
 		}
 
 		private async Task LoadPostContentAsync(
@@ -1534,7 +1583,7 @@ namespace HNReader
 				DateTimeOffset cachedFetchedUtc = DateTimeOffset.MinValue;
 				bool hasCachedComments = false;
 
-				lock (_cachedComments)
+				lock (_cacheStateLock)
 				{
 					if (_cachedComments.TryGetValue(post.Id, out var flat) && flat.Count > 0)
 					{
@@ -1567,11 +1616,22 @@ namespace HNReader
 					(cachedComments.Count > 0 || post.Descendants == 0);
 
 				// Render immediately from cache only when the cached tree is actually usable.
-				await DisplayPostAndCommentsAsync(
-					post,
-					canUseCachedTree ? cachedComments : Array.Empty<Comment>(),
-					isEphemeral,
-					focusCommentId);
+				if (canUseCachedTree)
+				{
+					await DisplayPostAndCommentsAsync(
+						post,
+						cachedComments!,
+						isEphemeral,
+						focusCommentId);
+				}
+				else
+				{
+					await DisplayPostAndCommentsAsync(
+						post,
+						[],
+						isEphemeral,
+						focusCommentId);
+				}
 
 				if (canUseCachedTree && !isEphemeral)
 					return;
@@ -1579,11 +1639,11 @@ namespace HNReader
 				if (isEphemeral && focusCommentId.HasValue)
 				{
 					// The target comment can only be focused after its branch has arrived.
-					await StreamCommentsIntoTreeAsync(post, isEphemeral, ct, focusCommentId.Value, cachedComments, hasCachedComments);
+					await StreamCommentsIntoTreeAsync(post, isEphemeral, focusCommentId.Value, cachedComments, hasCachedComments, ct);
 					return;
 				}
 
-				await StreamCommentsIntoTreeAsync(post, isEphemeral, ct, null, cachedComments, hasCachedComments);
+				await StreamCommentsIntoTreeAsync(post, isEphemeral, null, cachedComments, hasCachedComments, ct);
 			}
 			catch (OperationCanceledException)
 			{
@@ -1596,7 +1656,7 @@ namespace HNReader
 				// If the network path fails, fall back to stale cached comments without
 				// treating the cache as fresh for future requests.
 				List<Comment>? stale = null;
-				lock (_cachedComments)
+				lock (_cacheStateLock)
 				{
 					if (_cachedComments.TryGetValue(post.Id, out var flat) && flat.Count > 0)
 						stale = ReconstructCommentsFromCache(flat);
@@ -1634,45 +1694,25 @@ namespace HNReader
 		private async Task StreamCommentsIntoTreeAsync(
 			Post post,
 			bool isEphemeral,
-			CancellationToken ct,
 			int? focusCommentId,
 			List<Comment>? staleCache,
-			bool hadStaleCache)
+			bool hadStaleCache,
+			CancellationToken ct)
 		{
 			try
 			{
 				post = await EnsureKidsAsync(post, ct).ConfigureAwait(false);
-				var live = await client.GetCommentsTreeResultAsync(post, ct).ConfigureAwait(false);
 
-				// A failed live fetch should not be treated the same as a valid empty tree.
-				if (!live.Success)
+				var streamed = new List<Comment>();
+				await foreach (var comment in client.GetCommentsStreamAsync(post, ct))
 				{
-					if (hadStaleCache && staleCache != null && staleCache.Count > 0)
-					{
-						await DisplayPostAndCommentsAsync(post, staleCache, isEphemeral, focusCommentId);
-						return;
-					}
+					ct.ThrowIfCancellationRequested();
 
-					await RunOnUiAsync(() =>
-					{
-						CommentsTree.RootNodes.Clear();
-						CommentsTree.RootNodes.Add(new TreeViewNode
-						{
-							Content = new Comment
-							{
-								By = "HNReader",
-								Text = "Failed to load comments.",
-								Time = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-								Children = []
-							}
-						});
-					});
-
-					return;
+					streamed.Add(comment);
+					await AppendCommentRootAsync(comment).ConfigureAwait(false);
 				}
 
-				// Live fetch succeeded but there are no comments.
-				if (live.Comments.Count == 0)
+				if (streamed.Count == 0)
 				{
 					if (hadStaleCache && staleCache != null && staleCache.Count > 0)
 					{
@@ -1698,13 +1738,14 @@ namespace HNReader
 					return;
 				}
 
-				await DisplayPostAndCommentsAsync(post, live.Comments, isEphemeral, focusCommentId);
-
-				if (!isEphemeral && live.Comments.Count > 0)
+				if (!isEphemeral)
 				{
-					CacheCommentTree(post.Id, live.Comments);
+					CacheCommentTree(post.Id, streamed);
 					MarkPostsCacheDirty();
 				}
+
+				if (focusCommentId.HasValue)
+					FocusCommentInTree(focusCommentId.Value);
 			}
 			catch (OperationCanceledException)
 			{
@@ -1736,6 +1777,7 @@ namespace HNReader
 				});
 			}
 		}
+
 		private void CacheCommentTree(int postId, IEnumerable<Comment> comments, bool scheduleSave = true)
 		{
 			var flat = new List<CommentCacheItem>();
@@ -1838,7 +1880,7 @@ namespace HNReader
 			}
 
 			// If nothing was marked as root (defensive), treat all as roots
-			if (roots.Count == 0) roots = map.Values.ToList();
+			if (roots.Count == 0) roots = [.. map.Values];
 
 			return roots;
 		}
@@ -1873,6 +1915,7 @@ namespace HNReader
 		private async void OpenUrlButton_Click(object sender, RoutedEventArgs e)
 		{
 			var tag = (sender as FrameworkElement)?.Tag as string;
+			System.Diagnostics.Debug.WriteLine(tag);
 			if (string.IsNullOrWhiteSpace(tag)) return;
 			if (Uri.TryCreate(tag, UriKind.Absolute, out var uri))
 			{
@@ -1880,11 +1923,11 @@ namespace HNReader
 			}
 		}
 
-/*		private void CommentsTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
-		{
-			sender.SelectionMode = TreeViewSelectionMode.None; // disable selection highlight
-			return;
-		} */
+		/*		private void CommentsTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
+				{
+					sender.SelectionMode = TreeViewSelectionMode.None; // disable selection highlight
+					return;
+				} */
 
 		// Build a TreeViewNode from a Comment model (Content = Comment, not a UIElement)
 		// Replace your existing BuildNodeFromComment with this
@@ -2278,7 +2321,7 @@ namespace HNReader
 
 		private async Task FetchAndCacheAllCommentsAsync(CancellationToken ct)
 		{
-			const int MaxParallel = 6;
+			const int MaxParallel = 3;
 			var semaphore = new SemaphoreSlim(MaxParallel, MaxParallel);
 
 			var postsSnapshot = _posts.ToList();
@@ -2286,6 +2329,10 @@ namespace HNReader
 
 			foreach (var post in postsSnapshot)
 			{
+				if (post.Descendants > 200)
+				{
+					continue;
+				}
 				await semaphore.WaitAsync(ct).ConfigureAwait(false);
 				tasks.Add(Task.Run(async () =>
 				{
@@ -2311,7 +2358,7 @@ namespace HNReader
 							};
 						}
 
-						var tree = treeResult.Comments;
+						var tree = treeResult.Comments ?? [];
 
 						var flat = new List<CommentCacheItem>();
 
@@ -2338,7 +2385,7 @@ namespace HNReader
 									Walk(child, c.Id);
 						}
 
-						if (tree != null && tree.Count > 0)
+						if (tree.Count > 0)
 							foreach (var top in tree)
 								Walk(top, null);
 
@@ -2355,8 +2402,7 @@ namespace HNReader
 						await RunOnUiAsync(() =>
 						{
 							var existing = _posts.FirstOrDefault(x => x.Id == post.Id);
-							if (existing != null)
-								existing.Descendants = descendantsCount;
+							existing?.Descendants = descendantsCount;
 						});
 
 						SaveLastFetchTime(DateTimeOffset.UtcNow);
@@ -2369,11 +2415,134 @@ namespace HNReader
 					finally
 					{
 						semaphore.Release();
+						await Task.Delay(100, ct).ConfigureAwait(false);
 					}
 				}, ct));
 			}
 
 			await Task.WhenAll(tasks).ConfigureAwait(false);
+		}
+
+		private async void AccountButton_Click(object sender, RoutedEventArgs e)
+		{
+			if (_backend.IsAuthenticated)
+			{
+				await ShowAccountDialogAsync();
+				return;
+			}
+
+			await ShowLoginDialogAsync();
+		}
+
+		private async Task InitializeBackendAsync()
+		{
+			try
+			{
+				await _backend.InitializeAsync();
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"Backend init failed: {ex}");
+			}
+			finally
+			{
+				UpdateAccountButtonState();
+			}
+		}
+
+		private async Task ShowLoginDialogAsync()
+		{
+			var usernameBox = new TextBox
+			{
+				Header = "Username",
+				PlaceholderText = "Hacker News username",
+				MinWidth = 320,
+				Text = _backend.CurrentUserName ?? string.Empty
+			};
+
+			var passwordBox = new PasswordBox
+			{
+				Header = "Password",
+				MinWidth = 320
+			};
+
+			var panel = new StackPanel
+			{
+				Spacing = 12
+			};
+			panel.Children.Add(usernameBox);
+			panel.Children.Add(passwordBox);
+
+			var dialog = new ContentDialog
+			{
+				Title = "Sign in",
+				Content = panel,
+				PrimaryButtonText = "Sign in",
+				CloseButtonText = "Cancel",
+				DefaultButton = ContentDialogButton.Primary,
+				XamlRoot = Content.XamlRoot
+			};
+
+			var result = await dialog.ShowAsync();
+			if (result != ContentDialogResult.Primary)
+				return;
+
+			var login = await _backend.Accounts.LoginAsync(usernameBox.Text, passwordBox.Password);
+
+			if (!login.Success)
+			{
+				await ShowErrorDialog(login.Message ?? "Login failed.");
+				Debug.WriteLine($"Login failed: {login.Message}");
+				return;
+			}
+
+			UpdateAccountButtonState();
+		}
+
+		private async Task ShowAccountDialogAsync()
+		{
+			var dialog = new ContentDialog
+			{
+				Title = "Account",
+				Content = new TextBlock
+				{
+					Text = $"Signed in as {_backend.CurrentUserName}",
+					TextWrapping = TextWrapping.Wrap
+				},
+				PrimaryButtonText = "Sign out",
+				CloseButtonText = "Close",
+				DefaultButton = ContentDialogButton.Primary,
+				XamlRoot = Content.XamlRoot
+			};
+
+			var result = await dialog.ShowAsync();
+			if (result != ContentDialogResult.Primary)
+				return;
+
+			await _backend.Accounts.LogoutAsync();
+			UpdateAccountButtonState();
+		}
+		private void UpdateAccountButtonState()
+		{
+			try
+			{
+				ToolTipService.SetToolTip(
+					AccountButton,
+					_backend.IsAuthenticated
+						? $"Signed in as {_backend.CurrentUserName}"
+						: "Sign in");
+			}
+			catch { }
+		}
+
+		private void CommentUpvote_Click(object sender, RoutedEventArgs e)
+		{
+
+		}
+
+		private void PostUpvote_Click(object sender, RoutedEventArgs e)
+		{
+
 		}
 	}
 }

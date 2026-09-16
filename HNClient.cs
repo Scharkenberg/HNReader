@@ -7,12 +7,14 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace HNReader
 {
-	public class HNClient
+	public partial class HNClient
 	{
-		private static readonly HttpClient http = new HttpClient(new HttpClientHandler
+		private static readonly HttpClient http = new(new HttpClientHandler
 		{
 			AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
 			UseProxy = true,
@@ -25,10 +27,26 @@ namespace HNReader
 			DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
 		};
 
-		private static readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions
+		[JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
+		[JsonSerializable(typeof(List<int>))]
+		[JsonSerializable(typeof(Post))]
+		[JsonSerializable(typeof(HnItemRaw))]
+		[JsonSerializable(typeof(CommentRaw))]
+		private partial class HNJsonContext : JsonSerializerContext
 		{
-			PropertyNameCaseInsensitive = true
+		}
+
+		private static readonly JsonSerializerOptions jsonOptions = new()
+		{
+			PropertyNameCaseInsensitive = true,
+			TypeInfoResolver = HNJsonContext.Default
 		};
+
+		private static JsonTypeInfo<T> GetJsonTypeInfo<T>() where T : class
+		{
+			return HNJsonContext.Default.GetTypeInfo(typeof(T)) as JsonTypeInfo<T>
+				?? throw new NotSupportedException($"No JSON metadata for {typeof(T)}.");
+		}
 
 		// Completed-result cache. The requested CLR type is part of the key because
 		// one HN item can legitimately be deserialized as Post, HnItemRaw, or CommentRaw.
@@ -40,12 +58,12 @@ namespace HNReader
 
 		private readonly SemaphoreSlim _throttle;
 		private const int DefaultConcurrency = 32;
-		private const int CommentFetchBatchSize = 16;
+		private const int CommentFetchBatchSize = 4;
+		private static readonly TimeSpan CommentBatchDelay = TimeSpan.FromMilliseconds(100);
 
 		public HNClient(int maxConcurrency = DefaultConcurrency)
 		{
-			if (maxConcurrency < 1)
-				throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
+			ArgumentOutOfRangeException.ThrowIfLessThan(maxConcurrency, 1);
 
 			_throttle = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 		}
@@ -84,13 +102,13 @@ namespace HNReader
 		}
 
 		public async Task<HNResult> GetTopStoriesAsync(
-			int limit = 50,
+			int limit = 30,
 			CancellationToken ct = default)
 		{
 			try
 			{
 				var ids = await RetryAsync(
-					c => FetchItemWithThrottleAsync<List<int>>("topstories.json", -1, c),
+					c => FetchItemWithThrottleAsync<List<int>>("topstories.json", -1, GetJsonTypeInfo<List<int>>(), c),
 					ct,
 					maxAttempts: 3,
 					initialDelay: TimeSpan.FromMilliseconds(250)).ConfigureAwait(false);
@@ -102,7 +120,7 @@ namespace HNReader
 				var idSlice = ids.Take(take).ToArray();
 
 				var tasks = idSlice
-					.Select(id => FetchItemWithThrottleAsync<Post>($"item/{id}.json", id, ct))
+					.Select(id => FetchItemWithThrottleAsync<Post>($"item/{id}.json", id, GetJsonTypeInfo<Post>(), ct))
 					.ToArray();
 
 				var results = await Task.WhenAll(tasks).ConfigureAwait(false);
@@ -129,7 +147,7 @@ namespace HNReader
 
 		public async Task<Post?> GetItemAsync(int id, CancellationToken ct = default)
 		{
-			return await FetchItemWithThrottleAsync<Post>($"item/{id}.json", id, ct)
+			return await FetchItemWithThrottleAsync<Post>($"item/{id}.json", id, GetJsonTypeInfo<Post>(), ct)
 				.ConfigureAwait(false);
 		}
 
@@ -144,9 +162,7 @@ namespace HNReader
 			return (await GetCommentsTreeResultAsync(post, ct).ConfigureAwait(false)).Comments;
 		}
 
-		private static List<Comment> BuildCommentRoots(
-			Dictionary<int, CommentRaw> rawById,
-			IEnumerable<int> rootIds)
+		private static List<Comment> BuildCommentRoots(Dictionary<int, CommentRaw> rawById,	int[] rootIds)
 		{
 			var built = new Dictionary<int, List<Comment>>();
 			var building = new HashSet<int>();
@@ -214,7 +230,7 @@ namespace HNReader
 		{
 			try
 			{
-				return await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, ct)
+				return await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, GetJsonTypeInfo<CommentRaw>(),ct)
 					.ConfigureAwait(false);
 			}
 			catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -230,9 +246,10 @@ namespace HNReader
 		}
 
 		private async Task<T?> FetchItemWithThrottleAsync<T>(
-			string path,
-			int id,
-			CancellationToken ct) where T : class
+	string path,
+	int id,
+	JsonTypeInfo<T> typeInfo,
+	CancellationToken ct) where T : class
 		{
 			var cacheKey = $"{typeof(T).FullName}:{id}";
 
@@ -242,7 +259,7 @@ namespace HNReader
 			var request = _itemInFlight.GetOrAdd(
 				cacheKey,
 				_ => new Lazy<Task<object?>>(
-					() => FetchAndCacheAsync<T>(path, cacheKey),
+					() => FetchAndCacheAsync<T>(path, cacheKey, typeInfo),
 					LazyThreadSafetyMode.ExecutionAndPublication));
 
 			try
@@ -263,8 +280,10 @@ namespace HNReader
 			}
 		}
 
-		private async Task<object?> FetchAndCacheAsync<T>(string path, string cacheKey)
-			where T : class
+		private async Task<object?> FetchAndCacheAsync<T>(
+	string path,
+	string cacheKey,
+	JsonTypeInfo<T> typeInfo) where T : class
 		{
 			await _throttle.WaitAsync().ConfigureAwait(false);
 			try
@@ -272,7 +291,7 @@ namespace HNReader
 				if (_itemCache.TryGetValue(cacheKey, out var cached))
 					return cached;
 
-				var obj = await GetAsync<T>(path, CancellationToken.None).ConfigureAwait(false);
+				var obj = await GetAsync(path, typeInfo, CancellationToken.None).ConfigureAwait(false);
 				if (obj != null)
 					_itemCache.TryAdd(cacheKey, obj);
 
@@ -284,8 +303,12 @@ namespace HNReader
 			}
 		}
 
-		private static async Task<T?> GetAsync<T>(string path, CancellationToken ct)
+		private static async Task<T?> GetAsync<T>(
+	string path,
+	JsonTypeInfo<T> typeInfo,
+	CancellationToken ct) where T : class
 		{
+			http.DefaultRequestHeaders.Add("User-Agent", "curl/8.21");
 			using var resp = await http.GetAsync(
 				path,
 				HttpCompletionOption.ResponseHeadersRead,
@@ -303,20 +326,17 @@ namespace HNReader
 			}
 
 			await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-			return await JsonSerializer.DeserializeAsync<T>(stream, jsonOptions, ct)
+			return await JsonSerializer.DeserializeAsync(stream, typeInfo, ct)
 				.ConfigureAwait(false);
 		}
 
 		public async Task<(string? Type, int Id, int? Parent)> GetItemInfoAsync(
-			int id,
+			int id,							   
 			CancellationToken ct = default)
 		{
 			ct.ThrowIfCancellationRequested();
 
-			var raw = await FetchItemWithThrottleAsync<HnItemRaw>(
-				$"item/{id}.json",
-				id,
-				ct).ConfigureAwait(false);
+			var raw = await FetchItemWithThrottleAsync<HnItemRaw>($"item/{id}.json", id, GetJsonTypeInfo<HnItemRaw>(), ct).ConfigureAwait(false);
 
 			if (raw == null)
 				return (null, id, null);
@@ -334,10 +354,7 @@ namespace HNReader
 			{
 				ct.ThrowIfCancellationRequested();
 
-				var raw = await FetchItemWithThrottleAsync<HnItemRaw>(
-					$"item/{currentId}.json",
-					currentId,
-					ct).ConfigureAwait(false);
+				var raw = await FetchItemWithThrottleAsync<HnItemRaw>($"item/{currentId}.json", currentId, GetJsonTypeInfo<HnItemRaw>(), ct).ConfigureAwait(false);
 
 				if (raw == null)
 					return (null, null);
@@ -407,22 +424,26 @@ namespace HNReader
 		/// while allowing the UI to start rendering before the entire thread is fetched.
 		/// </summary>
 		public async IAsyncEnumerable<Comment> GetCommentsStreamAsync(
-			Post post,
-			[System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+	Post post,
+	[System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
 		{
 			if (post?.Kids == null || post.Kids.Count == 0)
 				yield break;
 
-			foreach (var rootId in post.Kids)
+			for (var i = 0; i < post.Kids.Count; i++)
 			{
 				ct.ThrowIfCancellationRequested();
 
+				var rootId = post.Kids[i];
 				var roots = await GetCommentBranchAsync(rootId, ct).ConfigureAwait(false);
 				foreach (var comment in roots)
 				{
 					ct.ThrowIfCancellationRequested();
 					yield return comment;
 				}
+
+				if (i + 1 < post.Kids.Count)
+					await Task.Delay(CommentBatchDelay, ct).ConfigureAwait(false);
 			}
 		}
 
@@ -465,6 +486,7 @@ namespace HNReader
 							pending.Enqueue(childId);
 					}
 				}
+				if (pending.Count > 0) await Task.Delay(CommentBatchDelay, ct).ConfigureAwait(false);
 			}
 
 			return BuildCommentRoots(rawById, [rootId]);
@@ -531,13 +553,14 @@ namespace HNReader
 							pending.Enqueue(childId);
 					}
 				}
+				if (pending.Count > 0) await Task.Delay(CommentBatchDelay, ct).ConfigureAwait(false);
 			}
 
 			return new CommentTreeResult
 			{
 				Success = !networkError,
 				IsNetworkError = networkError,
-				Comments = BuildCommentRoots(rawById, post.Kids)
+				Comments = BuildCommentRoots(rawById, post.Kids?.ToArray() ?? [])
 			};
 		}
 
@@ -549,7 +572,7 @@ namespace HNReader
 			{
 				return new CommentRawFetchResult
 				{
-					Raw = await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, ct)
+					Raw = await FetchItemWithThrottleAsync<CommentRaw>($"item/{id}.json", id, GetJsonTypeInfo<CommentRaw>(), ct)
 						.ConfigureAwait(false),
 					IsNetworkError = false
 				};
@@ -575,6 +598,8 @@ namespace HNReader
 	public class Comment
 	{
 		public int Id { get; set; }
+		public bool CanVote { get; set; }
+		public bool HasUpvoted { get; set; }
 		public bool Deleted { get; set; } = false;
 		public bool Dead { get; set; } = false;
 		public string? By { get; set; }
@@ -618,18 +643,23 @@ namespace HNReader
 		private HNResult() { }
 
 		public static HNResult OnSuccess(List<Post>? posts) =>
-			new HNResult { Success = true, Posts = posts! };
+			new()
+			{ Success = true, Posts = posts! };
 
 		public static HNResult OnFail(string message) =>
-			new HNResult { Success = false, ErrorMessage = message };
+			new()
+			{ Success = false, ErrorMessage = message };
 
 		public static HNResult OnNetworkFail(string message) =>
-			new HNResult { Success = false, IsNetworkError = true, ErrorMessage = message };
+			new()
+			{ Success = false, IsNetworkError = true, ErrorMessage = message };
 	}
 
 	public class Post
 	{
 		public int Id { get; set; }
+		public bool CanVote { get; set; }
+		public bool HasUpvoted { get; set; }
 		public string? Title { get; set; }
 		public string? By { get; set; }
 		public int Score { get; set; }
